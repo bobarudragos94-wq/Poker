@@ -1,0 +1,208 @@
+"""
+OCR module for reading text from PokerStars table regions.
+Reads stack sizes, pot amounts, blind levels, and player names.
+"""
+
+import re
+import logging
+from typing import Optional, Tuple
+
+import numpy as np
+
+try:
+    import pytesseract
+except ImportError:
+    pytesseract = None
+
+try:
+    from PIL import Image, ImageFilter, ImageEnhance
+except ImportError:
+    Image = None
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
+logger = logging.getLogger(__name__)
+
+
+class OCRReader:
+    """Reads text from screen regions using Tesseract OCR."""
+
+    def __init__(self, language: str = "eng", psm: int = 7):
+        """
+        Args:
+            language: Tesseract language code.
+            psm: Page segmentation mode (7 = single line, 8 = single word).
+        """
+        self.language = language
+        self.psm = psm
+
+        if pytesseract is None:
+            logger.warning("pytesseract not installed - OCR will not work")
+
+    def preprocess_for_ocr(self, img: np.ndarray,
+                           invert: bool = True,
+                           threshold: bool = True,
+                           scale: float = 2.0) -> np.ndarray:
+        """
+        Preprocess an image region for better OCR accuracy.
+        PokerStars uses light text on dark backgrounds.
+        """
+        if cv2 is None:
+            return img
+
+        processed = img.copy()
+
+        # Scale up for better OCR accuracy
+        if scale != 1.0:
+            h, w = processed.shape[:2]
+            processed = cv2.resize(processed, (int(w * scale), int(h * scale)),
+                                   interpolation=cv2.INTER_CUBIC)
+
+        # Convert to grayscale
+        if len(processed.shape) == 3:
+            processed = cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY)
+
+        # Invert if needed (PokerStars has light text on dark bg)
+        if invert:
+            mean_val = np.mean(processed)
+            if mean_val < 128:  # Dark background
+                processed = cv2.bitwise_not(processed)
+
+        # Apply threshold for clean binary image
+        if threshold:
+            processed = cv2.GaussianBlur(processed, (3, 3), 0)
+            _, processed = cv2.threshold(processed, 0, 255,
+                                         cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        return processed
+
+    def read_text(self, img: np.ndarray, whitelist: str = "",
+                  preprocess: bool = True) -> str:
+        """
+        Read text from a numpy image array.
+
+        Args:
+            img: Image as numpy array (BGR or grayscale).
+            whitelist: Characters to restrict OCR to.
+            preprocess: Whether to apply preprocessing.
+
+        Returns:
+            Recognized text string.
+        """
+        if pytesseract is None:
+            return ""
+
+        if preprocess:
+            img = self.preprocess_for_ocr(img)
+
+        # Build tesseract config
+        config = f"--psm {self.psm}"
+        if whitelist:
+            config += f" -c tessedit_char_whitelist={whitelist}"
+
+        try:
+            if len(img.shape) == 2:
+                pil_img = Image.fromarray(img)
+            else:
+                pil_img = Image.fromarray(img[:, :, ::-1])  # BGR to RGB
+
+            text = pytesseract.image_to_string(pil_img, lang=self.language,
+                                               config=config)
+            return text.strip()
+        except Exception as e:
+            logger.error("OCR failed: %s", e)
+            return ""
+
+    def read_number(self, img: np.ndarray) -> Optional[float]:
+        """
+        Read a numeric value from an image (stack size, pot, bet).
+        Handles formats like: 1,234  $1.5k  12.5M  1500  BB 15
+        """
+        whitelist = "0123456789,.$kKmMBb. "
+        text = self.read_text(img, whitelist=whitelist)
+
+        if not text:
+            return None
+
+        return self.parse_number(text)
+
+    @staticmethod
+    def parse_number(text: str) -> Optional[float]:
+        """Parse a number string with various poker formats."""
+        text = text.strip().upper()
+
+        # Remove common prefixes/suffixes
+        text = text.replace("$", "").replace("BB", "").replace(",", "")
+        text = text.replace(" ", "")
+
+        if not text:
+            return None
+
+        try:
+            # Handle K/M suffixes (e.g., "1.5K" = 1500)
+            multiplier = 1
+            if text.endswith("K"):
+                multiplier = 1000
+                text = text[:-1]
+            elif text.endswith("M"):
+                multiplier = 1000000
+                text = text[:-1]
+
+            return float(text) * multiplier
+        except ValueError:
+            # Try extracting just digits
+            digits = re.findall(r'[\d.]+', text)
+            if digits:
+                try:
+                    return float(digits[0]) * multiplier
+                except ValueError:
+                    pass
+            return None
+
+    def read_blind_level(self, img: np.ndarray) -> Optional[Tuple[float, float, float]]:
+        """
+        Read blind level from the table header.
+        Returns (small_blind, big_blind, ante) or None.
+        Formats: "100/200" or "100/200 ante 25" or "Level 5: 100/200/25"
+        """
+        text = self.read_text(img, whitelist="0123456789/: anteLevelBblid")
+
+        if not text:
+            return None
+
+        # Extract numbers from the text
+        numbers = re.findall(r'[\d,]+', text.replace(",", ""))
+
+        if len(numbers) >= 2:
+            try:
+                sb = float(numbers[-3]) if len(numbers) >= 3 else float(numbers[0])
+                bb = float(numbers[-2]) if len(numbers) >= 3 else float(numbers[1])
+                ante = float(numbers[-1]) if len(numbers) >= 3 else 0
+                # Heuristic: if 3 numbers and last is much smaller, it's ante
+                if len(numbers) >= 3 and ante > bb:
+                    sb = float(numbers[0])
+                    bb = float(numbers[1])
+                    ante = float(numbers[2]) if len(numbers) > 2 else 0
+                return (sb, bb, ante)
+            except (ValueError, IndexError):
+                pass
+
+        return None
+
+    def detect_action_buttons(self, img: np.ndarray) -> dict:
+        """
+        Detect which action buttons are visible (Fold, Check, Call, Raise, All-in).
+        Returns dict of {action: is_visible}.
+        """
+        text = self.read_text(img, preprocess=True).upper()
+
+        return {
+            "fold": "FOLD" in text,
+            "check": "CHECK" in text,
+            "call": "CALL" in text,
+            "raise": "RAISE" in text or "BET" in text,
+            "allin": "ALL" in text or "ALLIN" in text,
+        }

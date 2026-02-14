@@ -1,0 +1,18 @@
+# Core GUI framework
+PyQt6>=6.5.0
+
+# Screen capture
+mss>=9.0.0
+
+# Image processing & computer vision
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# OCR (requires Tesseract installed on system)
+pytesseract>=0.3.10
+
+# NumPy for image arrays
+numpy>=1.24.0
+
+# Windows-only: window detection (optional)
+# pywin32>=306; sys_platform == "win32"
