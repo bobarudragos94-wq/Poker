@@ -39,6 +39,7 @@ class MainWindow(QMainWindow):
         self.scan_timer.timeout.connect(self._on_scan_tick)
 
         self._is_scanning = False
+        self._consecutive_failures = 0
 
         self._setup_ui()
         self.setWindowTitle("Poker GTO Assistant")
@@ -374,7 +375,18 @@ class MainWindow(QMainWindow):
             # Read table state
             state = self.table_reader.read_state()
             if state is None:
+                self._consecutive_failures += 1
+                # After several failures, the window may have closed or moved;
+                # invalidate and re-detect on the next tick
+                if self._consecutive_failures >= 10:
+                    self.table_reader.capture.invalidate_window()
+                    self._consecutive_failures = 0
+                    self._log("Lost table window - attempting to re-detect...")
+                if self.overlay:
+                    self.overlay.set_scanning()
                 return
+
+            self._consecutive_failures = 0
 
             # Get decision
             decision = self.advisor.analyze(state)

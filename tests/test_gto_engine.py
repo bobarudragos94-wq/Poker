@@ -355,5 +355,41 @@ class TestCardDetection:
             Card.from_string("Xz")
 
 
+class TestScreenCapture:
+    """Tests for window detection patterns."""
+
+    def test_is_pokerstars_window_tournament(self):
+        from screen_reader.capture import ScreenCapture
+        # Tournament table titles should match
+        assert ScreenCapture._is_pokerstars_window(
+            "Tournament #3932271610 Table 1 - $0.25+$0.00 - No Limit Hold'em"
+        )
+        assert ScreenCapture._is_pokerstars_window(
+            "Tournament #12345 Table 3 - Turbo"
+        )
+
+    def test_is_pokerstars_window_spin_and_go(self):
+        from screen_reader.capture import ScreenCapture
+        assert ScreenCapture._is_pokerstars_window(
+            "Spin & Go #98765 Table 1 - No Limit Hold'em"
+        )
+
+    def test_is_pokerstars_window_not_matching(self):
+        from screen_reader.capture import ScreenCapture
+        # Regular non-poker windows should not match
+        assert not ScreenCapture._is_pokerstars_window("Google Chrome")
+        assert not ScreenCapture._is_pokerstars_window("Microsoft Word")
+        assert not ScreenCapture._is_pokerstars_window("Tournament Bracket")
+        assert not ScreenCapture._is_pokerstars_window("")
+
+    def test_invalidate_window(self):
+        from screen_reader.capture import ScreenCapture
+        sc = ScreenCapture()
+        sc.set_window_rect(100, 200, 800, 600)
+        assert sc.is_window_found()
+        sc.invalidate_window()
+        assert not sc.is_window_found()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

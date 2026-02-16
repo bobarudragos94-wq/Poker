@@ -4,6 +4,7 @@ Uses mss for fast cross-platform screen capture and can locate the
 PokerStars window automatically.
 """
 
+import re
 import sys
 import logging
 from typing import Optional, Tuple
@@ -50,6 +51,30 @@ class ScreenCapture:
         self._window_rect: Optional[Tuple[int, int, int, int]] = None
         self._sct = mss.mss() if mss else None
 
+    @classmethod
+    def _is_pokerstars_window(cls, title: str) -> bool:
+        """Check if a window title matches known PokerStars table patterns.
+
+        PokerStars cash tables usually contain 'PokerStars' in the title,
+        but tournament tables use titles like:
+          'Tournament #123456789 Table 1 - No Limit Hold'em'
+          'Spin & Go #123456 Table 1 - ...'
+        which do NOT contain 'PokerStars'.
+        """
+        title_lower = title.lower()
+        # Tournament table: "Tournament #... Table ..."
+        if "tournament" in title_lower and "table" in title_lower:
+            return True
+        # Spin & Go table
+        if "spin" in title_lower and "go" in title_lower and "table" in title_lower:
+            return True
+        return False
+
+    def invalidate_window(self):
+        """Clear cached window position to force re-detection on next capture."""
+        self._window_rect = None
+        logger.debug("Window rect invalidated - will re-detect on next capture")
+
     def find_window(self) -> Optional[Tuple[int, int, int, int]]:
         """
         Find the PokerStars window and return its (left, top, width, height).
@@ -74,7 +99,8 @@ class ScreenCapture:
         def enum_callback(hwnd, _):
             if win32gui.IsWindowVisible(hwnd):
                 title = win32gui.GetWindowText(hwnd)
-                if self.window_title.lower() in title.lower():
+                if (self.window_title.lower() in title.lower() or
+                        self._is_pokerstars_window(title)):
                     rect = win32gui.GetWindowRect(hwnd)
                     left, top, right, bottom = rect
                     result.append((left, top, right - left, bottom - top))
@@ -92,8 +118,11 @@ class ScreenCapture:
     def _find_window_linux(self) -> Optional[Tuple[int, int, int, int]]:
         """Find window on Linux using xdotool/wmctrl."""
         try:
+            # Build pattern that matches both regular and tournament tables
+            escaped_title = re.escape(self.window_title)
+            search_pattern = f"{escaped_title}|Tournament.*Table|Spin.*Go.*Table"
             result = subprocess.run(
-                ["xdotool", "search", "--name", self.window_title],
+                ["xdotool", "search", "--name", search_pattern],
                 capture_output=True, text=True, timeout=5
             )
             if result.returncode == 0 and result.stdout.strip():
