@@ -3,7 +3,7 @@ name: Build Installer
 on:
   # Build on every push to main (artifacts available for download)
   push:
-    branches: [main]
+    branches: [main, claude/poker-gto-assistant-xA5EM]
     # Build and create a release when a version tag is pushed
     tags:
       - "v*"
