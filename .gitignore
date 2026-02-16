@@ -30,3 +30,7 @@ desktop.ini
 
 # Logs
 *.log
+
+# Build artifacts
+*.zip
+gh_*/
