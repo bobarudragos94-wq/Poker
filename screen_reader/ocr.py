@@ -5,6 +5,9 @@ Reads stack sizes, pot amounts, blind levels, and player names.
 
 import re
 import logging
+import os
+import sys
+import platform
 from typing import Optional, Tuple
 
 import numpy as np
@@ -25,6 +28,36 @@ except ImportError:
     cv2 = None
 
 logger = logging.getLogger(__name__)
+
+
+def _configure_bundled_tesseract():
+    """Auto-detect and configure Tesseract from a PyInstaller bundle."""
+    if pytesseract is None:
+        return
+
+    # When running from a PyInstaller bundle, sys._MEIPASS points to the
+    # temporary folder where bundled files are extracted.
+    base_path = getattr(sys, "_MEIPASS", None)
+    if base_path is None:
+        return
+
+    tess_dir = os.path.join(base_path, "tesseract")
+
+    if platform.system() == "Windows":
+        tess_exe = os.path.join(tess_dir, "tesseract.exe")
+    else:
+        tess_exe = os.path.join(tess_dir, "tesseract")
+
+    if os.path.isfile(tess_exe):
+        pytesseract.pytesseract.tesseract_cmd = tess_exe
+        # Point TESSDATA_PREFIX so Tesseract finds its language files
+        tessdata = os.path.join(tess_dir, "tessdata")
+        if os.path.isdir(tessdata):
+            os.environ["TESSDATA_PREFIX"] = tess_dir
+        logger.info("Using bundled Tesseract: %s", tess_exe)
+
+
+_configure_bundled_tesseract()
 
 
 class OCRReader:
