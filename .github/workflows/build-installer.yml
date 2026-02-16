@@ -4,9 +4,9 @@ on:
   # Build on every push to main (artifacts available for download)
   push:
     branches: [main]
-  # Build and create a release when a version tag is pushed
-  tags:
-    - "v*"
+    # Build and create a release when a version tag is pushed
+    tags:
+      - "v*"
   # Allow manual trigger from the Actions tab
   workflow_dispatch:
 
