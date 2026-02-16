@@ -1,0 +1,86 @@
+name: Build Installer
+
+on:
+  # Build on every push to main (artifacts available for download)
+  push:
+    branches: [main]
+  # Build and create a release when a version tag is pushed
+  tags:
+    - "v*"
+  # Allow manual trigger from the Actions tab
+  workflow_dispatch:
+
+permissions:
+  contents: write  # needed to create releases
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: PokerGTOAssistant-windows-x64
+          - os: ubuntu-22.04
+            artifact: PokerGTOAssistant-linux-x64
+          - os: macos-13
+            artifact: PokerGTOAssistant-macos-x64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # --- Install Tesseract ---
+      - name: Install Tesseract (Windows)
+        if: runner.os == 'Windows'
+        run: choco install tesseract --no-progress -y
+
+      - name: Install Tesseract (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tesseract-ocr tesseract-ocr-eng
+
+      - name: Install Tesseract (macOS)
+        if: runner.os == 'macOS'
+        run: brew install tesseract
+
+      # --- Install Python dependencies ---
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      # --- Build ---
+      - name: Build with PyInstaller
+        run: python -m PyInstaller --noconfirm poker_gto.spec
+
+      # --- Package ---
+      - name: Create zip (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          cd dist
+          zip -r ../${{ matrix.artifact }}.zip PokerGTOAssistant/
+
+      - name: Create zip (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist\PokerGTOAssistant -DestinationPath ${{ matrix.artifact }}.zip
+
+      # --- Upload as workflow artifact (always) ---
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip
+
+      # --- Attach to GitHub Release (only on tag push) ---
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact }}.zip
