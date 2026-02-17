@@ -272,22 +272,36 @@ class TableStateReader:
         """Read hero's hole cards.
 
         Tries adaptive scanning first (finds card shapes in a wide area),
-        then falls back to fixed region coordinates.
+        then supplements with fixed region detection if needed.
         """
         # Method 1: Adaptive detection - scan bottom center for card shapes
         cards = self._find_hero_cards_adaptive(img)
         if len(cards) == 2:
             return cards
 
-        # Method 2: Fixed region detection (fallback)
-        cards = []
+        # Method 2: If adaptive found 1, try fixed regions for the other
+        if len(cards) == 1:
+            for region in [self.regions.hero_card1, self.regions.hero_card2]:
+                card_img = self._crop_region(img, region)
+                if card_img is not None:
+                    card = self.card_detector.detect_card(card_img)
+                    if card and card != cards[0]:
+                        cards.append(card)
+                        break
+            if len(cards) == 2:
+                return cards
+
+        # Method 3: Fixed region detection only (fallback)
+        fixed_cards = []
         for region in [self.regions.hero_card1, self.regions.hero_card2]:
             card_img = self._crop_region(img, region)
             if card_img is not None:
                 card = self.card_detector.detect_card(card_img)
                 if card:
-                    cards.append(card)
-        return cards
+                    fixed_cards.append(card)
+
+        # Return whichever found more cards
+        return cards if len(cards) >= len(fixed_cards) else fixed_cards
 
     def _find_hero_cards_adaptive(self, img: np.ndarray) -> List[Card]:
         """
@@ -295,34 +309,33 @@ class TableStateReader:
         detection.  Much more robust than fixed pixel coordinates because it
         finds card-shaped white rectangles regardless of exact position.
 
-        Uses a two-pass approach: first with strict thresholds, then with
-        relaxed thresholds if the first pass doesn't find a pair.  This
-        handles PokerStars tournament tables with dark/blue felt where
-        card backgrounds may appear dimmer.
+        Uses multiple passes with progressively looser thresholds, including
+        a grayscale brightness pass as a final fallback.  Returns the best
+        result found (1 or 2 cards) rather than requiring exactly 2.
         """
         if cv2 is None:
             return []
 
         h_img, w_img = img.shape[:2]
 
-        # Search area: center 40% of width, ~55-88% from top
-        # Covers hero card positions on both 6-max and 9-max tables
+        # Search area: center 40% of width, 52-75% from top.
+        # Deliberately stops ABOVE the player name / stack area (~75-80%)
+        # to avoid white text contours merging with card contours.
         sx1 = int(w_img * 0.30)
         sx2 = int(w_img * 0.70)
         sy1 = int(h_img * 0.52)
-        sy2 = int(h_img * 0.88)
+        sy2 = int(h_img * 0.75)
         search = img[sy1:sy2, sx1:sx2]
 
         if search.size == 0:
             return []
 
         hsv = cv2.cvtColor(search, cv2.COLOR_BGR2HSV)
+        best_cards = []
 
-        # Two-pass detection: strict first, then relaxed
+        # --- HSV-based passes (strict, then relaxed) ---
         threshold_sets = [
-            # Pass 1: strict (high confidence)
             (np.array([0, 0, 150]), np.array([180, 80, 255])),
-            # Pass 2: relaxed (handles dim/off-white cards on blue felt)
             (np.array([0, 0, 100]), np.array([180, 120, 255])),
         ]
 
@@ -331,96 +344,165 @@ class TableStateReader:
                                         sx1, sy1, w_img, h_img)
             if len(cards) == 2:
                 return cards
+            if len(cards) > len(best_cards):
+                best_cards = cards
 
-        return []
+        # --- Grayscale brightness pass ---
+        # Cards are bright objects on a dark table.  A simple brightness
+        # threshold avoids HSV saturation/hue issues entirely.
+        gray = cv2.cvtColor(search, cv2.COLOR_BGR2GRAY)
+        for thresh in (150, 120):
+            _, binary = cv2.threshold(gray, thresh, 255, cv2.THRESH_BINARY)
+            cards = self._gray_contour_pass(img, binary,
+                                            sx1, sy1, w_img, h_img)
+            if len(cards) == 2:
+                return cards
+            if len(cards) > len(best_cards):
+                best_cards = cards
+
+        return best_cards
+
+    # ----- helpers for the adaptive scanner -----
 
     def _adaptive_pass(self, img: np.ndarray, hsv: np.ndarray,
                        lower: np.ndarray, upper: np.ndarray,
                        sx1: int, sy1: int,
                        w_img: int, h_img: int) -> List[Card]:
-        """Single pass of adaptive card detection with the given HSV thresholds."""
+        """Single HSV-threshold pass of adaptive card detection."""
         white_mask = cv2.inRange(hsv, lower, upper)
+        return self._find_cards_in_mask(img, white_mask,
+                                        sx1, sy1, w_img, h_img,
+                                        tag=f"HSV V>={lower[2]}")
 
-        # Clean up noise
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE,
-                                       kernel, iterations=2)
-        white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel)
+    def _gray_contour_pass(self, img: np.ndarray, binary: np.ndarray,
+                           sx1: int, sy1: int,
+                           w_img: int, h_img: int) -> List[Card]:
+        """Grayscale brightness pass of adaptive card detection."""
+        return self._find_cards_in_mask(img, binary,
+                                        sx1, sy1, w_img, h_img,
+                                        tag="gray")
 
-        contours, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL,
+    def _find_cards_in_mask(self, img: np.ndarray, mask: np.ndarray,
+                            sx1: int, sy1: int,
+                            w_img: int, h_img: int,
+                            tag: str = "") -> List[Card]:
+        """Find card-shaped contours in a binary mask and detect cards."""
+        # Morphological cleanup — use 5x5 kernel to bridge small gaps
+        # between the white card background and the rank/suit graphics.
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+        kernel_sm = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_sm)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
                                         cv2.CHAIN_APPROX_SIMPLE)
 
         # Expected card dimensions (proportional to full image)
-        card_min_w = w_img * 0.025
-        card_max_w = w_img * 0.09
-        card_min_h = h_img * 0.06
-        card_max_h = h_img * 0.18
+        card_min_w = w_img * 0.020    # slightly looser than before
+        card_max_w = w_img * 0.10
+        card_min_h = h_img * 0.05
+        card_max_h = h_img * 0.20
 
         single_rects = []   # Individual card-shaped rectangles
-        merged_rects = []   # Two overlapping cards merged into one blob
+        partial_rects = []  # Narrow rects (partially hidden card)
+        merged_rects = []   # Two overlapping cards as one blob
 
         for c in contours:
             bx, by, bw, bh = cv2.boundingRect(c)
-            if bw < card_min_w * 0.7 or bh < card_min_h * 0.7:
+            if bw < 15 or bh < card_min_h * 0.5:
                 continue
 
             aspect = bh / bw if bw > 0 else 0
 
-            # Single card: aspect ratio ~1.0-2.0
+            # Full single card: relaxed aspect 0.7-2.5
             if card_min_w <= bw <= card_max_w and card_min_h <= bh <= card_max_h:
-                if 1.0 <= aspect <= 2.0:
+                if 0.7 <= aspect <= 2.5:
                     single_rects.append((bx + sx1, by + sy1, bw, bh))
 
-            # Merged pair: wider, lower aspect ratio
-            if bw > card_min_w * 1.4 and bh > card_min_h:
-                if 0.5 <= aspect <= 1.3:
+            # Partial card (left card hidden behind right card on PS)
+            if card_min_w * 0.3 <= bw < card_min_w and card_min_h * 0.7 <= bh <= card_max_h:
+                if 1.0 <= aspect <= 4.0:
+                    partial_rects.append((bx + sx1, by + sy1, bw, bh))
+
+            # Merged pair: wider blob
+            if bw > card_min_w * 1.2 and bh > card_min_h * 0.7:
+                if 0.3 <= aspect <= 1.5:
                     merged_rects.append((bx + sx1, by + sy1, bw, bh))
 
-        # Try to find a pair from individual card rects
+        logger.debug("Adaptive [%s]: %d contours, %d single, %d partial, %d merged",
+                     tag, len(contours), len(single_rects),
+                     len(partial_rects), len(merged_rects))
+
+        center_x = w_img / 2
+
+        # Strategy 1: pair two full single cards
         if len(single_rects) >= 2:
-            single_rects.sort(key=lambda r: r[0])
-            center_x = w_img / 2
-            best_pair = None
-            best_dist = float('inf')
-
-            for i in range(len(single_rects)):
-                for j in range(i + 1, len(single_rects)):
-                    r1, r2 = single_rects[i], single_rects[j]
-                    # Must be at similar y position
-                    if abs(r1[1] - r2[1]) > max(r1[3], r2[3]) * 0.4:
-                        continue
-                    # Not too far apart horizontally
-                    gap = r2[0] - (r1[0] + r1[2])
-                    if gap > max(r1[2], r2[2]) * 1.5:
-                        continue
-                    # Prefer pair closest to horizontal center
-                    pair_cx = (r1[0] + r1[2] / 2 + r2[0] + r2[2] / 2) / 2
-                    dist = abs(pair_cx - center_x)
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_pair = ((r1, r2) if r1[0] <= r2[0]
-                                     else (r2, r1))
-
-            if best_pair:
-                cards = self._detect_cards_from_rects(img, best_pair)
+            pair = self._best_pair(single_rects, center_x)
+            if pair:
+                cards = self._detect_cards_from_rects(img, pair)
                 if len(cards) == 2:
                     return cards
 
-        # Try merged rects (two overlapping cards as one blob)
+        # Strategy 2: pair a full card + a partial card
+        if single_rects and partial_rects:
+            combined = single_rects + partial_rects
+            pair = self._best_pair(combined, center_x)
+            if pair:
+                cards = self._detect_cards_from_rects(img, pair)
+                if len(cards) == 2:
+                    return cards
+
+        # Strategy 3: split a merged blob
         if merged_rects:
-            center_x = w_img / 2
             merged_rects.sort(key=lambda r: abs(r[0] + r[2] / 2 - center_x))
             mx, my, mw, mh = merged_rects[0]
-            # Split in half with slight overlap
             half = mw // 2
-            overlap = int(mw * 0.12)
+            overlap = int(mw * 0.15)
             r1 = (mx, my, half + overlap, mh)
             r2 = (mx + half - overlap, my, mw - half + overlap, mh)
             cards = self._detect_cards_from_rects(img, (r1, r2))
             if len(cards) == 2:
                 return cards
 
+        # Strategy 4: return best single card (don't discard partial results)
+        all_candidates = single_rects + partial_rects
+        if all_candidates:
+            all_candidates.sort(key=lambda r: abs(r[0] + r[2] / 2 - center_x))
+            for rect in all_candidates[:3]:
+                cards = self._detect_cards_from_rects(img, [rect])
+                if len(cards) == 1:
+                    return cards
+
         return []
+
+    @staticmethod
+    def _best_pair(rects, center_x, max_y_diff_ratio=0.5,
+                   max_gap_ratio=2.0):
+        """Find the best pair of nearby, same-height rectangles closest to center."""
+        if len(rects) < 2:
+            return None
+
+        rects_sorted = sorted(rects, key=lambda r: r[0])
+        best_pair = None
+        best_dist = float('inf')
+
+        for i in range(len(rects_sorted)):
+            for j in range(i + 1, len(rects_sorted)):
+                r1, r2 = rects_sorted[i], rects_sorted[j]
+                # Must be at similar y position
+                if abs(r1[1] - r2[1]) > max(r1[3], r2[3]) * max_y_diff_ratio:
+                    continue
+                # Not too far apart horizontally
+                gap = r2[0] - (r1[0] + r1[2])
+                if gap > max(r1[2], r2[2]) * max_gap_ratio:
+                    continue
+                pair_cx = (r1[0] + r1[2] / 2 + r2[0] + r2[2] / 2) / 2
+                dist = abs(pair_cx - center_x)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_pair = (r1, r2) if r1[0] <= r2[0] else (r2, r1)
+
+        return best_pair
 
     def _detect_cards_from_rects(self, img: np.ndarray,
                                   rects) -> List[Card]:
@@ -490,8 +572,8 @@ class TableStateReader:
             # Save the wide search area (same region as adaptive scanner)
             sx1 = int(w_img * 0.30)
             sx2 = int(w_img * 0.70)
-            sy1 = int(h_img * 0.55)
-            sy2 = int(h_img * 0.85)
+            sy1 = int(h_img * 0.52)
+            sy2 = int(h_img * 0.75)
             search_crop = img[sy1:sy2, sx1:sx2].copy()
 
             # Draw fixed-region rectangles on the search crop for comparison
