@@ -3,7 +3,7 @@ name: Build Installer
 on:
   # Build on every push to main (artifacts available for download)
   push:
-    branches: [main, claude/poker-gto-assistant-xA5EM]
+    branches: [main, claude/poker-gto-assistant-xA5EM, claude/fix-tournament-scanning-1bLRM]
     # Build and create a release when a version tag is pushed
     tags:
       - "v*"
@@ -38,7 +38,12 @@ jobs:
       # --- Install Tesseract ---
       - name: Install Tesseract (Windows)
         if: runner.os == 'Windows'
-        run: choco install tesseract --no-progress -y
+        run: |
+          choco install tesseract --no-progress -y
+          # Verify installation and show paths for debugging
+          where tesseract
+          tesseract --version
+          dir "C:\Program Files\Tesseract-OCR\tessdata" 2>nul || echo "tessdata not at Program Files"
 
       - name: Install Tesseract (Linux)
         if: runner.os == 'Linux'
@@ -58,6 +63,22 @@ jobs:
       # --- Build ---
       - name: Build with PyInstaller
         run: python -m PyInstaller --noconfirm poker_gto.spec
+
+      # --- Verify tesseract was bundled (fail fast if missing) ---
+      - name: Verify tessdata bundled
+        shell: bash
+        run: |
+          if [ -d "dist/PokerGTOAssistant/_internal/tesseract/tessdata" ]; then
+            echo "tessdata directory found:"
+            ls -la dist/PokerGTOAssistant/_internal/tesseract/tessdata/
+          elif [ -d "dist/PokerGTOAssistant/_internal/tesseract" ]; then
+            echo "ERROR: tesseract dir exists but tessdata subdir is MISSING"
+            echo "Contents of tesseract dir:"
+            ls -la dist/PokerGTOAssistant/_internal/tesseract/
+            exit 1
+          else
+            echo "WARNING: No bundled tesseract directory found (expected on non-Windows)"
+          fi
 
       # --- Package ---
       - name: Create zip (Linux/macOS)
