@@ -155,8 +155,9 @@ class CardDetector:
     def _is_card_present(self, img: np.ndarray) -> bool:
         """
         Check if a card is present in the image region.
-        Cards are white/light colored; empty spaces are green felt.
-        Uses multiple strategies to handle different PokerStars themes.
+        Cards are white/light colored; empty spaces are table felt.
+        Uses multiple strategies to handle different PokerStars themes
+        (green felt for cash games, blue/navy felt for tournaments).
         """
         if cv2 is None or img is None:
             return False
@@ -164,39 +165,47 @@ class CardDetector:
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
         # Strategy 1: Check for white/light pixels (card background)
-        # Cards are mostly white with low saturation and high value
-        lower_white = np.array([0, 0, 170])
-        upper_white = np.array([180, 60, 255])
+        # Cards are mostly white with low saturation and high value.
+        # Use a generous threshold to handle slight off-whites and shadows.
+        lower_white = np.array([0, 0, 130])
+        upper_white = np.array([180, 80, 255])
         white_mask = cv2.inRange(hsv, lower_white, upper_white)
         white_ratio = np.sum(white_mask > 0) / white_mask.size
 
-        if white_ratio > 0.10:
+        if white_ratio > 0.08:
             logger.debug("Card present (white): ratio=%.3f", white_ratio)
             return True
 
-        # Strategy 2: Check that this is NOT green felt.
-        # If a card is present, the region won't be mostly green.
-        # Green felt: H=35-85, S>40, V=40-200
+        # Strategy 2: Check that this is NOT table felt (green OR blue).
+        # PokerStars uses green felt for cash and blue/navy for tournaments.
+        # Green felt: H=30-90
         lower_green = np.array([30, 40, 40])
         upper_green = np.array([90, 255, 200])
         green_mask = cv2.inRange(hsv, lower_green, upper_green)
         green_ratio = np.sum(green_mask > 0) / green_mask.size
 
-        # If region is mostly NOT green felt, a card may be present
-        # (handles dark/colored card themes)
-        if green_ratio < 0.20:
-            # Additionally check for some light or colored content (not just dark/empty)
-            lower_light = np.array([0, 0, 100])
+        # Blue felt (common in PokerStars tournaments): H=90-140
+        lower_blue = np.array([90, 30, 20])
+        upper_blue = np.array([140, 255, 200])
+        blue_mask = cv2.inRange(hsv, lower_blue, upper_blue)
+        blue_ratio = np.sum(blue_mask > 0) / blue_mask.size
+
+        felt_ratio = green_ratio + blue_ratio
+
+        # If region is mostly NOT felt, a card may be present
+        if felt_ratio < 0.30:
+            lower_light = np.array([0, 0, 80])
             upper_light = np.array([180, 255, 255])
             light_mask = cv2.inRange(hsv, lower_light, upper_light)
             light_ratio = np.sum(light_mask > 0) / light_mask.size
 
-            if light_ratio > 0.25:
-                logger.debug("Card present (non-green): green=%.3f light=%.3f",
-                             green_ratio, light_ratio)
+            if light_ratio > 0.20:
+                logger.debug("Card present (non-felt): green=%.3f blue=%.3f light=%.3f",
+                             green_ratio, blue_ratio, light_ratio)
                 return True
 
-        logger.debug("No card present: white=%.3f green=%.3f", white_ratio, green_ratio)
+        logger.debug("No card present: white=%.3f green=%.3f blue=%.3f",
+                     white_ratio, green_ratio, blue_ratio)
         return False
 
     def _detect_rank(self, img: np.ndarray) -> Optional[str]:

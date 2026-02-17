@@ -389,6 +389,56 @@ class TestScreenCapture:
         assert sc.is_window_found()
         sc.invalidate_window()
         assert not sc.is_window_found()
+        assert sc.found_window_title is None
+
+    def test_found_window_title_property(self):
+        from screen_reader.capture import ScreenCapture
+        sc = ScreenCapture()
+        assert sc.found_window_title is None
+        sc._found_window_title = "Test Title"
+        assert sc.found_window_title == "Test Title"
+
+
+class TestTitleParsing:
+    """Tests for parsing blind levels from PokerStars window titles."""
+
+    def test_parse_blinds_standard(self):
+        from screen_reader.table_state import TableStateReader
+        title = ("$11 Mini Daily Cooldown [Turbo, Mystery Bounty], $25K Gtd "
+                 "- 150/300 ante 40 - Tournament 3974764671 Table 119 "
+                 "- Logged In as bobarudragos")
+        result = TableStateReader._parse_blinds_from_title(title)
+        assert result == (150.0, 300.0, 40.0)
+
+    def test_parse_blinds_no_ante(self):
+        from screen_reader.table_state import TableStateReader
+        title = "$5.50 Turbo - 25/50 - Tournament 12345 Table 1"
+        result = TableStateReader._parse_blinds_from_title(title)
+        assert result == (25.0, 50.0, 0.0)
+
+    def test_parse_blinds_with_commas(self):
+        from screen_reader.table_state import TableStateReader
+        title = "High Roller - 1,000/2,000 ante 200 - Tournament 99 Table 1"
+        result = TableStateReader._parse_blinds_from_title(title)
+        assert result == (1000.0, 2000.0, 200.0)
+
+    def test_parse_blinds_level_format(self):
+        from screen_reader.table_state import TableStateReader
+        # Some titles include level info as "Level 5: 100/200"
+        title = "Tournament #123 Table 1 - Level 5: 100/200"
+        result = TableStateReader._parse_blinds_from_title(title)
+        assert result is not None
+        assert result[0] == 100.0
+        assert result[1] == 200.0
+
+    def test_parse_blinds_none_for_empty(self):
+        from screen_reader.table_state import TableStateReader
+        assert TableStateReader._parse_blinds_from_title("") is None
+        assert TableStateReader._parse_blinds_from_title(None) is None
+
+    def test_parse_blinds_none_for_no_match(self):
+        from screen_reader.table_state import TableStateReader
+        assert TableStateReader._parse_blinds_from_title("Google Chrome") is None
 
 
 if __name__ == "__main__":

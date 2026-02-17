@@ -5,6 +5,7 @@ to build a complete picture of the current game state.
 
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple
@@ -293,27 +294,52 @@ class TableStateReader:
         Scan the bottom-center of the table for hero cards using contour
         detection.  Much more robust than fixed pixel coordinates because it
         finds card-shaped white rectangles regardless of exact position.
+
+        Uses a two-pass approach: first with strict thresholds, then with
+        relaxed thresholds if the first pass doesn't find a pair.  This
+        handles PokerStars tournament tables with dark/blue felt where
+        card backgrounds may appear dimmer.
         """
         if cv2 is None:
             return []
 
         h_img, w_img = img.shape[:2]
 
-        # Search area: center 40% of width, ~58-82% from top
-        # This is where hero cards always appear on a PokerStars 6-max table
+        # Search area: center 40% of width, ~55-88% from top
+        # Covers hero card positions on both 6-max and 9-max tables
         sx1 = int(w_img * 0.30)
         sx2 = int(w_img * 0.70)
-        sy1 = int(h_img * 0.55)
-        sy2 = int(h_img * 0.85)
+        sy1 = int(h_img * 0.52)
+        sy2 = int(h_img * 0.88)
         search = img[sy1:sy2, sx1:sx2]
 
         if search.size == 0:
             return []
 
-        # Find white/light areas (card backgrounds)
         hsv = cv2.cvtColor(search, cv2.COLOR_BGR2HSV)
-        white_mask = cv2.inRange(hsv, np.array([0, 0, 150]),
-                                      np.array([180, 80, 255]))
+
+        # Two-pass detection: strict first, then relaxed
+        threshold_sets = [
+            # Pass 1: strict (high confidence)
+            (np.array([0, 0, 150]), np.array([180, 80, 255])),
+            # Pass 2: relaxed (handles dim/off-white cards on blue felt)
+            (np.array([0, 0, 100]), np.array([180, 120, 255])),
+        ]
+
+        for lower, upper in threshold_sets:
+            cards = self._adaptive_pass(img, hsv, lower, upper,
+                                        sx1, sy1, w_img, h_img)
+            if len(cards) == 2:
+                return cards
+
+        return []
+
+    def _adaptive_pass(self, img: np.ndarray, hsv: np.ndarray,
+                       lower: np.ndarray, upper: np.ndarray,
+                       sx1: int, sy1: int,
+                       w_img: int, h_img: int) -> List[Card]:
+        """Single pass of adaptive card detection with the given HSV thresholds."""
+        white_mask = cv2.inRange(hsv, lower, upper)
 
         # Clean up noise
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
@@ -430,16 +456,19 @@ class TableStateReader:
             avg_h = float(np.mean(hsv[:, :, 0]))
             avg_s = float(np.mean(hsv[:, :, 1]))
             avg_v = float(np.mean(hsv[:, :, 2]))
-            # Check how much is white vs green
-            white_mask = cv2.inRange(hsv, np.array([0, 0, 170]),
-                                     np.array([180, 60, 255]))
+            # Check how much is white vs felt (green or blue)
+            white_mask = cv2.inRange(hsv, np.array([0, 0, 130]),
+                                     np.array([180, 80, 255]))
             green_mask = cv2.inRange(hsv, np.array([30, 40, 40]),
                                      np.array([90, 255, 200]))
+            blue_mask = cv2.inRange(hsv, np.array([90, 30, 20]),
+                                    np.array([140, 255, 200]))
             white_pct = np.sum(white_mask > 0) / white_mask.size * 100
             green_pct = np.sum(green_mask > 0) / green_mask.size * 100
+            blue_pct = np.sum(blue_mask > 0) / blue_mask.size * 100
             return (f"region ({x},{y},{w},{h}) "
                     f"avgHSV=({avg_h:.0f},{avg_s:.0f},{avg_v:.0f}) "
-                    f"white={white_pct:.0f}% green={green_pct:.0f}%")
+                    f"white={white_pct:.0f}% green={green_pct:.0f}% blue={blue_pct:.0f}%")
         except Exception as e:
             return f"diag error: {e}"
 
@@ -516,10 +545,55 @@ class TableStateReader:
         return 0.0
 
     def _read_blinds(self, img: np.ndarray) -> Optional[Tuple[float, float, float]]:
-        """Read blind level information."""
+        """Read blind level information.
+
+        Tries parsing from the PokerStars window title first (most reliable
+        for tournaments — the title always contains e.g. '150/300 ante 40').
+        Falls back to OCR on the table image if the title is unavailable.
+        """
+        # Method 1: parse from the (refreshed) window title
+        title = self.capture.refresh_window_title()
+        if title:
+            result = self._parse_blinds_from_title(title)
+            if result:
+                return result
+
+        # Method 2: OCR on the blind-info region (fallback)
         blind_img = self._crop_region(img, self.regions.blind_info)
         if blind_img is not None:
             return self.ocr.read_blind_level(blind_img)
+        return None
+
+    @staticmethod
+    def _parse_blinds_from_title(title: str) -> Optional[Tuple[float, float, float]]:
+        """Parse blind level from a PokerStars window title.
+
+        Title examples:
+          '$11 Mini Daily Cooldown ... - 150/300 ante 40 - Tournament 3974764671 Table 119 ...'
+          '$5.50 Turbo ... - 25/50 - Tournament ...'
+          'Tournament #123456 Table 1 - 1000/2000 Ante 100 - No Limit Hold''em'
+        """
+        if not title:
+            return None
+
+        # Look for "X/Y" optionally followed by "ante Z" (case-insensitive).
+        # This pattern reliably appears in PokerStars tournament window titles.
+        match = re.search(
+            r'(\d[\d,]*)\s*/\s*(\d[\d,]*)\s*(?:ante\s+(\d[\d,]*))?',
+            title, re.IGNORECASE,
+        )
+        if match:
+            try:
+                sb = float(match.group(1).replace(",", ""))
+                bb = float(match.group(2).replace(",", ""))
+                ante = float(match.group(3).replace(",", "")) if match.group(3) else 0.0
+                if sb > bb:
+                    sb, bb = bb, sb
+                logger.debug("Parsed blinds from title: sb=%.0f bb=%.0f ante=%.0f",
+                             sb, bb, ante)
+                return (sb, bb, ante)
+            except (ValueError, IndexError):
+                pass
         return None
 
     def _read_players(self, img: np.ndarray) -> List[PlayerState]:
