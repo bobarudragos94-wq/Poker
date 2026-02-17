@@ -88,6 +88,25 @@ class ScreenCapture:
             logger.warning("Unsupported platform for window detection: %s", sys.platform)
             return None
 
+    @staticmethod
+    def _get_dwm_frame_rect(hwnd) -> Optional[Tuple[int, int, int, int]]:
+        """Get the actual visible frame bounds using DWM, excluding invisible shadow borders."""
+        try:
+            import ctypes
+            import ctypes.wintypes
+            DWMWA_EXTENDED_FRAME_BOUNDS = 9
+            rect = ctypes.wintypes.RECT()
+            hr = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+                hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+                ctypes.byref(rect), ctypes.sizeof(rect)
+            )
+            if hr == 0:  # S_OK
+                return (rect.left, rect.top,
+                        rect.right - rect.left, rect.bottom - rect.top)
+        except Exception as e:
+            logger.debug("DwmGetWindowAttribute failed: %s", e)
+        return None
+
     def _find_window_win32(self) -> Optional[Tuple[int, int, int, int]]:
         """Find window on Windows using win32gui."""
         if not HAS_WIN32:
@@ -101,9 +120,18 @@ class ScreenCapture:
                 title = win32gui.GetWindowText(hwnd)
                 if (self.window_title.lower() in title.lower() or
                         self._is_pokerstars_window(title)):
-                    rect = win32gui.GetWindowRect(hwnd)
-                    left, top, right, bottom = rect
-                    result.append((left, top, right - left, bottom - top))
+                    # Use DWM to get actual visible bounds (excludes shadow)
+                    dwm_rect = ScreenCapture._get_dwm_frame_rect(hwnd)
+                    if dwm_rect:
+                        result.append(dwm_rect)
+                    else:
+                        # Fallback: clamp negative coords from GetWindowRect
+                        rect = win32gui.GetWindowRect(hwnd)
+                        left, top, right, bottom = rect
+                        adj_left = max(0, left)
+                        adj_top = max(0, top)
+                        result.append((adj_left, adj_top,
+                                       right - adj_left, bottom - adj_top))
 
         win32gui.EnumWindows(enum_callback, None)
 

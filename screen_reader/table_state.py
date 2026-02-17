@@ -177,6 +177,8 @@ class TableStateReader:
 
         # Read hero's cards
         state.hero_cards = self._read_hero_cards(table_img)
+        if not state.hero_cards:
+            logger.debug("No hero cards detected (image %dx%d)", w_img, h_img)
 
         # Read board cards
         state.board_cards = self._read_board_cards(table_img)

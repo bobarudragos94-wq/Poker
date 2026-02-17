@@ -376,6 +376,8 @@ class MainWindow(QMainWindow):
             state = self.table_reader.read_state()
             if state is None:
                 self._consecutive_failures += 1
+                if self._consecutive_failures == 1:
+                    logger.info("read_state() returned None (capture may have failed)")
                 # After several failures, the window may have closed or moved;
                 # invalidate and re-detect on the next tick
                 if self._consecutive_failures >= 10:
@@ -387,6 +389,20 @@ class MainWindow(QMainWindow):
                 return
 
             self._consecutive_failures = 0
+
+            # Log state summary periodically (every ~5 seconds)
+            self._scan_tick_count = getattr(self, '_scan_tick_count', 0) + 1
+            if self._scan_tick_count % 10 == 1:
+                logger.info(
+                    "Scan state: hero_cards=%s board=%s pot=%.1f "
+                    "blinds=%s/%s street=%s players=%d dealer=%d",
+                    [str(c) for c in state.hero_cards],
+                    [str(c) for c in state.board_cards],
+                    state.pot_size,
+                    state.small_blind, state.big_blind,
+                    state.street, state.active_players,
+                    state.dealer_seat,
+                )
 
             # Get decision
             decision = self.advisor.analyze(state)
@@ -404,7 +420,7 @@ class MainWindow(QMainWindow):
             )
 
         except Exception as e:
-            logger.error("Scan error: %s", e)
+            logger.error("Scan error: %s", e, exc_info=True)
             self._log(f"Error: {e}")
 
     # === Manual Input ===

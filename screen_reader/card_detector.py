@@ -130,18 +130,22 @@ class CardDetector:
             Card object or None if no card detected.
         """
         if img is None or img.size == 0:
+            logger.debug("Card detect: empty image")
             return None
 
         # Check if the region actually contains a card (not empty/green felt)
         if not self._is_card_present(img):
+            logger.debug("Card detect: no card present (%dx%d region)", img.shape[1], img.shape[0])
             return None
 
         rank = self._detect_rank(img)
         suit = self._detect_suit(img)
 
         if rank and suit:
+            logger.debug("Card detected: %s%s", rank, suit)
             return Card(rank=rank, suit=suit)
 
+        logger.debug("Card detect: partial match rank=%s suit=%s", rank, suit)
         return None
 
     def detect_multiple_cards(self, images: List[np.ndarray]) -> List[Optional[Card]]:
