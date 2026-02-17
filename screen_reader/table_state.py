@@ -4,6 +4,7 @@ to build a complete picture of the current game state.
 """
 
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple
@@ -191,6 +192,9 @@ class TableStateReader:
                             "- %s "
                             "- use 'Save Debug Screenshot' to check region alignment",
                             w_img, h_img, self._no_cards_count, diag)
+            # Save debug images on first failure and periodically
+            if self._no_cards_count in (1, 3, 50):
+                self._save_hero_debug_images(table_img, self._no_cards_count)
 
             # After many consecutive failures, the window may be wrong (e.g.,
             # lobby captured instead of table).  Force re-detection.
@@ -264,7 +268,17 @@ class TableStateReader:
         return state
 
     def _read_hero_cards(self, img: np.ndarray) -> List[Card]:
-        """Read hero's hole cards."""
+        """Read hero's hole cards.
+
+        Tries adaptive scanning first (finds card shapes in a wide area),
+        then falls back to fixed region coordinates.
+        """
+        # Method 1: Adaptive detection - scan bottom center for card shapes
+        cards = self._find_hero_cards_adaptive(img)
+        if len(cards) == 2:
+            return cards
+
+        # Method 2: Fixed region detection (fallback)
         cards = []
         for region in [self.regions.hero_card1, self.regions.hero_card2]:
             card_img = self._crop_region(img, region)
@@ -272,6 +286,133 @@ class TableStateReader:
                 card = self.card_detector.detect_card(card_img)
                 if card:
                     cards.append(card)
+        return cards
+
+    def _find_hero_cards_adaptive(self, img: np.ndarray) -> List[Card]:
+        """
+        Scan the bottom-center of the table for hero cards using contour
+        detection.  Much more robust than fixed pixel coordinates because it
+        finds card-shaped white rectangles regardless of exact position.
+        """
+        if cv2 is None:
+            return []
+
+        h_img, w_img = img.shape[:2]
+
+        # Search area: center 40% of width, ~58-82% from top
+        # This is where hero cards always appear on a PokerStars 6-max table
+        sx1 = int(w_img * 0.30)
+        sx2 = int(w_img * 0.70)
+        sy1 = int(h_img * 0.55)
+        sy2 = int(h_img * 0.85)
+        search = img[sy1:sy2, sx1:sx2]
+
+        if search.size == 0:
+            return []
+
+        # Find white/light areas (card backgrounds)
+        hsv = cv2.cvtColor(search, cv2.COLOR_BGR2HSV)
+        white_mask = cv2.inRange(hsv, np.array([0, 0, 150]),
+                                      np.array([180, 80, 255]))
+
+        # Clean up noise
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE,
+                                       kernel, iterations=2)
+        white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel)
+
+        contours, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL,
+                                        cv2.CHAIN_APPROX_SIMPLE)
+
+        # Expected card dimensions (proportional to full image)
+        card_min_w = w_img * 0.025
+        card_max_w = w_img * 0.09
+        card_min_h = h_img * 0.06
+        card_max_h = h_img * 0.18
+
+        single_rects = []   # Individual card-shaped rectangles
+        merged_rects = []   # Two overlapping cards merged into one blob
+
+        for c in contours:
+            bx, by, bw, bh = cv2.boundingRect(c)
+            if bw < card_min_w * 0.7 or bh < card_min_h * 0.7:
+                continue
+
+            aspect = bh / bw if bw > 0 else 0
+
+            # Single card: aspect ratio ~1.0-2.0
+            if card_min_w <= bw <= card_max_w and card_min_h <= bh <= card_max_h:
+                if 1.0 <= aspect <= 2.0:
+                    single_rects.append((bx + sx1, by + sy1, bw, bh))
+
+            # Merged pair: wider, lower aspect ratio
+            if bw > card_min_w * 1.4 and bh > card_min_h:
+                if 0.5 <= aspect <= 1.3:
+                    merged_rects.append((bx + sx1, by + sy1, bw, bh))
+
+        # Try to find a pair from individual card rects
+        if len(single_rects) >= 2:
+            single_rects.sort(key=lambda r: r[0])
+            center_x = w_img / 2
+            best_pair = None
+            best_dist = float('inf')
+
+            for i in range(len(single_rects)):
+                for j in range(i + 1, len(single_rects)):
+                    r1, r2 = single_rects[i], single_rects[j]
+                    # Must be at similar y position
+                    if abs(r1[1] - r2[1]) > max(r1[3], r2[3]) * 0.4:
+                        continue
+                    # Not too far apart horizontally
+                    gap = r2[0] - (r1[0] + r1[2])
+                    if gap > max(r1[2], r2[2]) * 1.5:
+                        continue
+                    # Prefer pair closest to horizontal center
+                    pair_cx = (r1[0] + r1[2] / 2 + r2[0] + r2[2] / 2) / 2
+                    dist = abs(pair_cx - center_x)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_pair = ((r1, r2) if r1[0] <= r2[0]
+                                     else (r2, r1))
+
+            if best_pair:
+                cards = self._detect_cards_from_rects(img, best_pair)
+                if len(cards) == 2:
+                    return cards
+
+        # Try merged rects (two overlapping cards as one blob)
+        if merged_rects:
+            center_x = w_img / 2
+            merged_rects.sort(key=lambda r: abs(r[0] + r[2] / 2 - center_x))
+            mx, my, mw, mh = merged_rects[0]
+            # Split in half with slight overlap
+            half = mw // 2
+            overlap = int(mw * 0.12)
+            r1 = (mx, my, half + overlap, mh)
+            r2 = (mx + half - overlap, my, mw - half + overlap, mh)
+            cards = self._detect_cards_from_rects(img, (r1, r2))
+            if len(cards) == 2:
+                return cards
+
+        return []
+
+    def _detect_cards_from_rects(self, img: np.ndarray,
+                                  rects) -> List[Card]:
+        """Detect cards from a sequence of (x, y, w, h) bounding rects."""
+        h_img, w_img = img.shape[:2]
+        cards = []
+        for rx, ry, rw, rh in rects:
+            y1 = max(0, ry)
+            y2 = min(h_img, ry + rh)
+            x1 = max(0, rx)
+            x2 = min(w_img, rx + rw)
+            card_img = img[y1:y2, x1:x2]
+            if card_img.size > 0:
+                card = self.card_detector.detect_card(card_img)
+                if card:
+                    cards.append(card)
+                    logger.debug("Adaptive found %s at (%d,%d,%d,%d)",
+                                 card, rx, ry, rw, rh)
         return cards
 
     def _diagnose_hero_region(self, img: np.ndarray) -> str:
@@ -301,6 +442,52 @@ class TableStateReader:
                     f"white={white_pct:.0f}% green={green_pct:.0f}%")
         except Exception as e:
             return f"diag error: {e}"
+
+    def _save_hero_debug_images(self, img: np.ndarray, attempt: int):
+        """Save debug images showing what the hero card search area contains.
+
+        Saves into a ``debug/`` directory next to the executable:
+        - ``hero_search.png`` - the wide search area with fixed-region boxes drawn
+        - ``hero_card1_fixed.png`` / ``hero_card2_fixed.png`` - the fixed-region crops
+        """
+        try:
+            if cv2 is None:
+                return
+            debug_dir = os.path.join(os.getcwd(), "debug")
+            os.makedirs(debug_dir, exist_ok=True)
+
+            h_img, w_img = img.shape[:2]
+
+            # Save the wide search area (same region as adaptive scanner)
+            sx1 = int(w_img * 0.30)
+            sx2 = int(w_img * 0.70)
+            sy1 = int(h_img * 0.55)
+            sy2 = int(h_img * 0.85)
+            search_crop = img[sy1:sy2, sx1:sx2].copy()
+
+            # Draw fixed-region rectangles on the search crop for comparison
+            for i, region in enumerate([self.regions.hero_card1,
+                                         self.regions.hero_card2]):
+                x, y, w, h = self._scale_region(region, w_img, h_img)
+                rx, ry = x - sx1, y - sy1
+                cv2.rectangle(search_crop, (rx, ry), (rx + w, ry + h),
+                              (0, 255, 0), 2)
+                cv2.putText(search_crop, f"fixed{i+1}", (rx, ry - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+            cv2.imwrite(os.path.join(debug_dir, "hero_search.png"), search_crop)
+
+            # Save fixed-region crops
+            for i, region in enumerate([self.regions.hero_card1,
+                                         self.regions.hero_card2]):
+                crop = self._crop_region(img, region)
+                if crop is not None:
+                    cv2.imwrite(os.path.join(debug_dir,
+                                f"hero_card{i+1}_fixed.png"), crop)
+
+            logger.info("Hero debug images saved to %s/", debug_dir)
+        except Exception as e:
+            logger.debug("Failed to save hero debug images: %s", e)
 
     def _read_board_cards(self, img: np.ndarray) -> List[Card]:
         """Read community cards (flop, turn, river)."""

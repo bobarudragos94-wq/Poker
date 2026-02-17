@@ -23,8 +23,9 @@ class TableRegions:
     """Screen regions for a 6-max PokerStars table (default 800x600 layout)."""
 
     # Hero's hole cards (two cards at the bottom center)
-    hero_card1: Region = (310, 405, 50, 70)
-    hero_card2: Region = (360, 405, 50, 70)
+    # Centered at x=400 (50% of 800), y=410 (68% of 600)
+    hero_card1: Region = (348, 408, 52, 72)
+    hero_card2: Region = (400, 408, 52, 72)
 
     # Community cards (flop, turn, river - centered)
     board_card1: Region = (230, 230, 50, 70)
