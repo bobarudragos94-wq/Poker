@@ -60,6 +60,10 @@ def _configure_bundled_tesseract():
         elif os.path.isfile(os.path.join(tess_dir, "eng.traineddata")):
             # Fallback: traineddata files sitting directly in tess_dir
             os.environ["TESSDATA_PREFIX"] = tess_dir
+        else:
+            logger.error("Bundled tesseract found at %s but no tessdata! "
+                         "Contents of tess_dir: %s",
+                         tess_exe, os.listdir(tess_dir) if os.path.isdir(tess_dir) else "<missing>")
         logger.info("Using bundled Tesseract: %s (TESSDATA_PREFIX=%s)",
                      tess_exe, os.environ.get("TESSDATA_PREFIX", "<not set>"))
 

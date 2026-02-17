@@ -25,8 +25,13 @@ if platform.system() == "Windows":
         os.path.join(os.environ.get("PROGRAMFILES(X86)", ""), "Tesseract-OCR"),
         os.path.join(os.environ.get("LOCALAPPDATA", ""), "Tesseract-OCR"),
     ]
+    # Also try finding tesseract on PATH (e.g. Chocolatey shimmed installs)
+    tess_which = shutil.which("tesseract")
+    if tess_which:
+        tess_candidates.insert(0, os.path.dirname(os.path.realpath(tess_which)))
     for tess_dir in tess_candidates:
         if os.path.isfile(os.path.join(tess_dir, "tesseract.exe")):
+            print(f"[spec] Found Tesseract at: {tess_dir}")
             # Bundle the tesseract executable
             tesseract_binaries.append(
                 (os.path.join(tess_dir, "tesseract.exe"), "tesseract")
@@ -40,8 +45,26 @@ if platform.system() == "Windows":
             # Bundle tessdata (language files)
             tessdata = os.path.join(tess_dir, "tessdata")
             if os.path.isdir(tessdata):
+                print(f"[spec] Bundling tessdata from: {tessdata}")
+                print(f"[spec] tessdata contents: {os.listdir(tessdata)}")
                 tesseract_datas.append((tessdata, "tesseract/tessdata"))
+            else:
+                print(f"[spec] WARNING: tessdata not found at {tessdata}")
+                # Search for tessdata in common Chocolatey / system locations
+                fallback_tessdata = [
+                    os.path.join(os.environ.get("PROGRAMDATA", ""), "chocolatey", "lib", "tesseract", "tools", "tessdata"),
+                    os.path.join(os.environ.get("PROGRAMDATA", ""), "chocolatey", "lib", "tesseract", "tools", "tesseract-ocr", "tessdata"),
+                ]
+                for fb in fallback_tessdata:
+                    if os.path.isdir(fb):
+                        print(f"[spec] Found tessdata at fallback: {fb}")
+                        tesseract_datas.append((fb, "tesseract/tessdata"))
+                        break
+                else:
+                    print("[spec] WARNING: No tessdata found — OCR will not work in bundled build!")
             break
+    else:
+        print("[spec] WARNING: Tesseract executable not found on this system")
 
 elif platform.system() == "Darwin":
     # macOS via Homebrew
