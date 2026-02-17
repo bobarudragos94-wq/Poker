@@ -49,7 +49,30 @@ class ScreenCapture:
     def __init__(self, window_title: str = "PokerStars"):
         self.window_title = window_title
         self._window_rect: Optional[Tuple[int, int, int, int]] = None
+        self._found_window_title: Optional[str] = None
+        self._hwnd = None  # Cached window handle (Windows only)
         self._sct = mss.mss() if mss else None
+
+    @property
+    def found_window_title(self) -> Optional[str]:
+        """The title of the most recently found/refreshed PokerStars window."""
+        return self._found_window_title
+
+    def refresh_window_title(self) -> Optional[str]:
+        """Re-read the window title from the cached window handle.
+
+        This is useful for tournament tables where blinds change and the
+        title is updated by PokerStars (e.g. '150/300 ante 40' -> '200/400 ante 50').
+        """
+        if sys.platform == "win32" and HAS_WIN32 and self._hwnd:
+            try:
+                title = win32gui.GetWindowText(self._hwnd)
+                if title:
+                    self._found_window_title = title
+                    return title
+            except Exception:
+                pass
+        return self._found_window_title
 
     @classmethod
     def _is_pokerstars_table(cls, title: str) -> bool:
@@ -85,6 +108,8 @@ class ScreenCapture:
     def invalidate_window(self):
         """Clear cached window position to force re-detection on next capture."""
         self._window_rect = None
+        self._found_window_title = None
+        self._hwnd = None
         logger.debug("Window rect invalidated - will re-detect on next capture")
 
     def find_window(self) -> Optional[Tuple[int, int, int, int]]:
@@ -178,22 +203,24 @@ class ScreenCapture:
                 rect = (adj_left, adj_top, right - adj_left, bottom - adj_top)
 
             if is_table:
-                table_windows.append((rect, title))
+                table_windows.append((rect, title, hwnd))
                 logger.debug("Found table window: '%s' at %s", title, rect)
             elif is_generic:
-                generic_windows.append((rect, title))
+                generic_windows.append((rect, title, hwnd))
                 logger.debug("Found generic PokerStars window: '%s' at %s", title, rect)
 
         win32gui.EnumWindows(enum_callback, None)
 
         # Prefer table windows over lobby/generic windows
         if table_windows:
-            self._window_rect, title = table_windows[0]
+            self._window_rect, title, self._hwnd = table_windows[0]
+            self._found_window_title = title
             logger.info("Found PokerStars table at %s ('%s')", self._window_rect, title)
             return self._window_rect
 
         if generic_windows:
-            self._window_rect, title = generic_windows[0]
+            self._window_rect, title, self._hwnd = generic_windows[0]
+            self._found_window_title = title
             logger.info("Found PokerStars window at %s ('%s') "
                         "(no table window found - may be lobby)",
                         self._window_rect, title)

@@ -5,6 +5,7 @@ to build a complete picture of the current game state.
 
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple
@@ -271,130 +272,245 @@ class TableStateReader:
         """Read hero's hole cards.
 
         Tries adaptive scanning first (finds card shapes in a wide area),
-        then falls back to fixed region coordinates.
+        then supplements with fixed region detection if needed.
         """
         # Method 1: Adaptive detection - scan bottom center for card shapes
         cards = self._find_hero_cards_adaptive(img)
         if len(cards) == 2:
             return cards
 
-        # Method 2: Fixed region detection (fallback)
-        cards = []
+        # Method 2: If adaptive found 1, try fixed regions for the other
+        if len(cards) == 1:
+            for region in [self.regions.hero_card1, self.regions.hero_card2]:
+                card_img = self._crop_region(img, region)
+                if card_img is not None:
+                    card = self.card_detector.detect_card(card_img)
+                    if card and card != cards[0]:
+                        cards.append(card)
+                        break
+            if len(cards) == 2:
+                return cards
+
+        # Method 3: Fixed region detection only (fallback)
+        fixed_cards = []
         for region in [self.regions.hero_card1, self.regions.hero_card2]:
             card_img = self._crop_region(img, region)
             if card_img is not None:
                 card = self.card_detector.detect_card(card_img)
                 if card:
-                    cards.append(card)
-        return cards
+                    fixed_cards.append(card)
+
+        # Return whichever found more cards
+        return cards if len(cards) >= len(fixed_cards) else fixed_cards
 
     def _find_hero_cards_adaptive(self, img: np.ndarray) -> List[Card]:
         """
         Scan the bottom-center of the table for hero cards using contour
         detection.  Much more robust than fixed pixel coordinates because it
         finds card-shaped white rectangles regardless of exact position.
+
+        Uses multiple passes with progressively looser thresholds, including
+        a grayscale brightness pass as a final fallback.  Returns the best
+        result found (1 or 2 cards) rather than requiring exactly 2.
         """
         if cv2 is None:
             return []
 
         h_img, w_img = img.shape[:2]
 
-        # Search area: center 40% of width, ~58-82% from top
-        # This is where hero cards always appear on a PokerStars 6-max table
-        sx1 = int(w_img * 0.30)
-        sx2 = int(w_img * 0.70)
-        sy1 = int(h_img * 0.55)
-        sy2 = int(h_img * 0.85)
+        # Search area: center 50% of width, 40-72% from top.
+        # On a 1920x1111 PokerStars table the hero cards sit at ~47-52%
+        # of the client-area height.  The player name/stack text sits at
+        # ~53-57%, so ending at 72% includes some text — the morphological
+        # filtering and contour-size checks handle the separation.
+        sx1 = int(w_img * 0.25)
+        sx2 = int(w_img * 0.75)
+        sy1 = int(h_img * 0.40)
+        sy2 = int(h_img * 0.72)
         search = img[sy1:sy2, sx1:sx2]
 
         if search.size == 0:
             return []
 
-        # Find white/light areas (card backgrounds)
         hsv = cv2.cvtColor(search, cv2.COLOR_BGR2HSV)
-        white_mask = cv2.inRange(hsv, np.array([0, 0, 150]),
-                                      np.array([180, 80, 255]))
+        best_cards = []
 
-        # Clean up noise
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE,
-                                       kernel, iterations=2)
-        white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel)
+        # --- HSV-based passes (strict, then relaxed) ---
+        threshold_sets = [
+            (np.array([0, 0, 150]), np.array([180, 80, 255])),
+            (np.array([0, 0, 100]), np.array([180, 120, 255])),
+        ]
 
-        contours, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL,
+        for lower, upper in threshold_sets:
+            cards = self._adaptive_pass(img, hsv, lower, upper,
+                                        sx1, sy1, w_img, h_img)
+            if len(cards) == 2:
+                return cards
+            if len(cards) > len(best_cards):
+                best_cards = cards
+
+        # --- Grayscale brightness pass ---
+        # Cards are bright objects on a dark table.  A simple brightness
+        # threshold avoids HSV saturation/hue issues entirely.
+        gray = cv2.cvtColor(search, cv2.COLOR_BGR2GRAY)
+        for thresh in (150, 120):
+            _, binary = cv2.threshold(gray, thresh, 255, cv2.THRESH_BINARY)
+            cards = self._gray_contour_pass(img, binary,
+                                            sx1, sy1, w_img, h_img)
+            if len(cards) == 2:
+                return cards
+            if len(cards) > len(best_cards):
+                best_cards = cards
+
+        return best_cards
+
+    # ----- helpers for the adaptive scanner -----
+
+    def _adaptive_pass(self, img: np.ndarray, hsv: np.ndarray,
+                       lower: np.ndarray, upper: np.ndarray,
+                       sx1: int, sy1: int,
+                       w_img: int, h_img: int) -> List[Card]:
+        """Single HSV-threshold pass of adaptive card detection."""
+        white_mask = cv2.inRange(hsv, lower, upper)
+        return self._find_cards_in_mask(img, white_mask,
+                                        sx1, sy1, w_img, h_img,
+                                        tag=f"HSV V>={lower[2]}")
+
+    def _gray_contour_pass(self, img: np.ndarray, binary: np.ndarray,
+                           sx1: int, sy1: int,
+                           w_img: int, h_img: int) -> List[Card]:
+        """Grayscale brightness pass of adaptive card detection."""
+        return self._find_cards_in_mask(img, binary,
+                                        sx1, sy1, w_img, h_img,
+                                        tag="gray")
+
+    def _find_cards_in_mask(self, img: np.ndarray, mask: np.ndarray,
+                            sx1: int, sy1: int,
+                            w_img: int, h_img: int,
+                            tag: str = "") -> List[Card]:
+        """Find card-shaped contours in a binary mask and detect cards."""
+        # Morphological cleanup:
+        # 1. CLOSE with a HORIZONTAL kernel (9x3) to bridge gaps within the
+        #    card face (between rank, suit, and white background) WITHOUT
+        #    bridging vertically to the player-name text ~10px below.
+        # 2. CLOSE with a small square kernel to fill remaining gaps.
+        # 3. OPEN with 5x5 to remove small noise and thin text lines.
+        kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_h, iterations=2)
+        kernel_sq = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_sq, iterations=1)
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
                                         cv2.CHAIN_APPROX_SIMPLE)
 
         # Expected card dimensions (proportional to full image)
-        card_min_w = w_img * 0.025
-        card_max_w = w_img * 0.09
-        card_min_h = h_img * 0.06
-        card_max_h = h_img * 0.18
+        card_min_w = w_img * 0.020    # slightly looser than before
+        card_max_w = w_img * 0.10
+        card_min_h = h_img * 0.05
+        card_max_h = h_img * 0.20
 
         single_rects = []   # Individual card-shaped rectangles
-        merged_rects = []   # Two overlapping cards merged into one blob
+        partial_rects = []  # Narrow rects (partially hidden card)
+        merged_rects = []   # Two overlapping cards as one blob
 
         for c in contours:
             bx, by, bw, bh = cv2.boundingRect(c)
-            if bw < card_min_w * 0.7 or bh < card_min_h * 0.7:
+            if bw < 15 or bh < card_min_h * 0.5:
                 continue
 
             aspect = bh / bw if bw > 0 else 0
 
-            # Single card: aspect ratio ~1.0-2.0
+            # Full single card: relaxed aspect 0.7-2.5
             if card_min_w <= bw <= card_max_w and card_min_h <= bh <= card_max_h:
-                if 1.0 <= aspect <= 2.0:
+                if 0.7 <= aspect <= 2.5:
                     single_rects.append((bx + sx1, by + sy1, bw, bh))
 
-            # Merged pair: wider, lower aspect ratio
-            if bw > card_min_w * 1.4 and bh > card_min_h:
-                if 0.5 <= aspect <= 1.3:
+            # Partial card (left card hidden behind right card on PS)
+            if card_min_w * 0.3 <= bw < card_min_w and card_min_h * 0.7 <= bh <= card_max_h:
+                if 1.0 <= aspect <= 4.0:
+                    partial_rects.append((bx + sx1, by + sy1, bw, bh))
+
+            # Merged pair: wider blob
+            if bw > card_min_w * 1.2 and bh > card_min_h * 0.7:
+                if 0.3 <= aspect <= 1.5:
                     merged_rects.append((bx + sx1, by + sy1, bw, bh))
 
-        # Try to find a pair from individual card rects
+        logger.info("Adaptive [%s]: %d contours, %d single, %d partial, %d merged",
+                    tag, len(contours), len(single_rects),
+                    len(partial_rects), len(merged_rects))
+
+        center_x = w_img / 2
+
+        # Strategy 1: pair two full single cards
         if len(single_rects) >= 2:
-            single_rects.sort(key=lambda r: r[0])
-            center_x = w_img / 2
-            best_pair = None
-            best_dist = float('inf')
-
-            for i in range(len(single_rects)):
-                for j in range(i + 1, len(single_rects)):
-                    r1, r2 = single_rects[i], single_rects[j]
-                    # Must be at similar y position
-                    if abs(r1[1] - r2[1]) > max(r1[3], r2[3]) * 0.4:
-                        continue
-                    # Not too far apart horizontally
-                    gap = r2[0] - (r1[0] + r1[2])
-                    if gap > max(r1[2], r2[2]) * 1.5:
-                        continue
-                    # Prefer pair closest to horizontal center
-                    pair_cx = (r1[0] + r1[2] / 2 + r2[0] + r2[2] / 2) / 2
-                    dist = abs(pair_cx - center_x)
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_pair = ((r1, r2) if r1[0] <= r2[0]
-                                     else (r2, r1))
-
-            if best_pair:
-                cards = self._detect_cards_from_rects(img, best_pair)
+            pair = self._best_pair(single_rects, center_x)
+            if pair:
+                cards = self._detect_cards_from_rects(img, pair)
                 if len(cards) == 2:
                     return cards
 
-        # Try merged rects (two overlapping cards as one blob)
+        # Strategy 2: pair a full card + a partial card
+        if single_rects and partial_rects:
+            combined = single_rects + partial_rects
+            pair = self._best_pair(combined, center_x)
+            if pair:
+                cards = self._detect_cards_from_rects(img, pair)
+                if len(cards) == 2:
+                    return cards
+
+        # Strategy 3: split a merged blob
         if merged_rects:
-            center_x = w_img / 2
             merged_rects.sort(key=lambda r: abs(r[0] + r[2] / 2 - center_x))
             mx, my, mw, mh = merged_rects[0]
-            # Split in half with slight overlap
             half = mw // 2
-            overlap = int(mw * 0.12)
+            overlap = int(mw * 0.15)
             r1 = (mx, my, half + overlap, mh)
             r2 = (mx + half - overlap, my, mw - half + overlap, mh)
             cards = self._detect_cards_from_rects(img, (r1, r2))
             if len(cards) == 2:
                 return cards
 
+        # Strategy 4: return best single card (don't discard partial results)
+        all_candidates = single_rects + partial_rects
+        if all_candidates:
+            all_candidates.sort(key=lambda r: abs(r[0] + r[2] / 2 - center_x))
+            for rect in all_candidates[:3]:
+                cards = self._detect_cards_from_rects(img, [rect])
+                if len(cards) == 1:
+                    return cards
+
         return []
+
+    @staticmethod
+    def _best_pair(rects, center_x, max_y_diff_ratio=0.5,
+                   max_gap_ratio=2.0):
+        """Find the best pair of nearby, same-height rectangles closest to center."""
+        if len(rects) < 2:
+            return None
+
+        rects_sorted = sorted(rects, key=lambda r: r[0])
+        best_pair = None
+        best_dist = float('inf')
+
+        for i in range(len(rects_sorted)):
+            for j in range(i + 1, len(rects_sorted)):
+                r1, r2 = rects_sorted[i], rects_sorted[j]
+                # Must be at similar y position
+                if abs(r1[1] - r2[1]) > max(r1[3], r2[3]) * max_y_diff_ratio:
+                    continue
+                # Not too far apart horizontally
+                gap = r2[0] - (r1[0] + r1[2])
+                if gap > max(r1[2], r2[2]) * max_gap_ratio:
+                    continue
+                pair_cx = (r1[0] + r1[2] / 2 + r2[0] + r2[2] / 2) / 2
+                dist = abs(pair_cx - center_x)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_pair = (r1, r2) if r1[0] <= r2[0] else (r2, r1)
+
+        return best_pair
 
     def _detect_cards_from_rects(self, img: np.ndarray,
                                   rects) -> List[Card]:
@@ -430,16 +546,19 @@ class TableStateReader:
             avg_h = float(np.mean(hsv[:, :, 0]))
             avg_s = float(np.mean(hsv[:, :, 1]))
             avg_v = float(np.mean(hsv[:, :, 2]))
-            # Check how much is white vs green
-            white_mask = cv2.inRange(hsv, np.array([0, 0, 170]),
-                                     np.array([180, 60, 255]))
+            # Check how much is white vs felt (green or blue)
+            white_mask = cv2.inRange(hsv, np.array([0, 0, 130]),
+                                     np.array([180, 80, 255]))
             green_mask = cv2.inRange(hsv, np.array([30, 40, 40]),
                                      np.array([90, 255, 200]))
+            blue_mask = cv2.inRange(hsv, np.array([90, 30, 20]),
+                                    np.array([140, 255, 200]))
             white_pct = np.sum(white_mask > 0) / white_mask.size * 100
             green_pct = np.sum(green_mask > 0) / green_mask.size * 100
+            blue_pct = np.sum(blue_mask > 0) / blue_mask.size * 100
             return (f"region ({x},{y},{w},{h}) "
                     f"avgHSV=({avg_h:.0f},{avg_s:.0f},{avg_v:.0f}) "
-                    f"white={white_pct:.0f}% green={green_pct:.0f}%")
+                    f"white={white_pct:.0f}% green={green_pct:.0f}% blue={blue_pct:.0f}%")
         except Exception as e:
             return f"diag error: {e}"
 
@@ -459,10 +578,10 @@ class TableStateReader:
             h_img, w_img = img.shape[:2]
 
             # Save the wide search area (same region as adaptive scanner)
-            sx1 = int(w_img * 0.30)
-            sx2 = int(w_img * 0.70)
-            sy1 = int(h_img * 0.55)
-            sy2 = int(h_img * 0.85)
+            sx1 = int(w_img * 0.25)
+            sx2 = int(w_img * 0.75)
+            sy1 = int(h_img * 0.40)
+            sy2 = int(h_img * 0.72)
             search_crop = img[sy1:sy2, sx1:sx2].copy()
 
             # Draw fixed-region rectangles on the search crop for comparison
@@ -516,10 +635,55 @@ class TableStateReader:
         return 0.0
 
     def _read_blinds(self, img: np.ndarray) -> Optional[Tuple[float, float, float]]:
-        """Read blind level information."""
+        """Read blind level information.
+
+        Tries parsing from the PokerStars window title first (most reliable
+        for tournaments — the title always contains e.g. '150/300 ante 40').
+        Falls back to OCR on the table image if the title is unavailable.
+        """
+        # Method 1: parse from the (refreshed) window title
+        title = self.capture.refresh_window_title()
+        if title:
+            result = self._parse_blinds_from_title(title)
+            if result:
+                return result
+
+        # Method 2: OCR on the blind-info region (fallback)
         blind_img = self._crop_region(img, self.regions.blind_info)
         if blind_img is not None:
             return self.ocr.read_blind_level(blind_img)
+        return None
+
+    @staticmethod
+    def _parse_blinds_from_title(title: str) -> Optional[Tuple[float, float, float]]:
+        """Parse blind level from a PokerStars window title.
+
+        Title examples:
+          '$11 Mini Daily Cooldown ... - 150/300 ante 40 - Tournament 3974764671 Table 119 ...'
+          '$5.50 Turbo ... - 25/50 - Tournament ...'
+          'Tournament #123456 Table 1 - 1000/2000 Ante 100 - No Limit Hold''em'
+        """
+        if not title:
+            return None
+
+        # Look for "X/Y" optionally followed by "ante Z" (case-insensitive).
+        # This pattern reliably appears in PokerStars tournament window titles.
+        match = re.search(
+            r'(\d[\d,]*)\s*/\s*(\d[\d,]*)\s*(?:ante\s+(\d[\d,]*))?',
+            title, re.IGNORECASE,
+        )
+        if match:
+            try:
+                sb = float(match.group(1).replace(",", ""))
+                bb = float(match.group(2).replace(",", ""))
+                ante = float(match.group(3).replace(",", "")) if match.group(3) else 0.0
+                if sb > bb:
+                    sb, bb = bb, sb
+                logger.debug("Parsed blinds from title: sb=%.0f bb=%.0f ante=%.0f",
+                             sb, bb, ante)
+                return (sb, bb, ante)
+            except (ValueError, IndexError):
+                pass
         return None
 
     def _read_players(self, img: np.ndarray) -> List[PlayerState]:
