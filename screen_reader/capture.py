@@ -52,13 +52,14 @@ class ScreenCapture:
         self._sct = mss.mss() if mss else None
 
     @classmethod
-    def _is_pokerstars_window(cls, title: str) -> bool:
+    def _is_pokerstars_table(cls, title: str) -> bool:
         """Check if a window title matches known PokerStars table patterns.
 
         PokerStars cash tables usually contain 'PokerStars' in the title,
         but tournament tables use titles like:
           'Tournament #123456789 Table 1 - No Limit Hold'em'
           'Spin & Go #123456 Table 1 - ...'
+          'Sit & Go #123456 Table 1 - ...'
         which do NOT contain 'PokerStars'.
         """
         title_lower = title.lower()
@@ -66,9 +67,20 @@ class ScreenCapture:
         if "tournament" in title_lower and "table" in title_lower:
             return True
         # Spin & Go table
-        if "spin" in title_lower and "go" in title_lower and "table" in title_lower:
+        if "spin" in title_lower and "table" in title_lower:
+            return True
+        # Sit & Go table
+        if "sit" in title_lower and "go" in title_lower and "table" in title_lower:
+            return True
+        # Generic PokerStars table pattern: contains "Table" followed by a number
+        if re.search(r'#\d+.*table\s*\d', title_lower):
             return True
         return False
+
+    @classmethod
+    def _is_pokerstars_window(cls, title: str) -> bool:
+        """Check if a window title belongs to PokerStars (table or lobby)."""
+        return cls._is_pokerstars_table(title)
 
     def invalidate_window(self):
         """Clear cached window position to force re-detection on next capture."""
@@ -107,37 +119,84 @@ class ScreenCapture:
             logger.debug("DwmGetWindowAttribute failed: %s", e)
         return None
 
+    @staticmethod
+    def _get_client_rect(hwnd) -> Optional[Tuple[int, int, int, int]]:
+        """Get the client area bounds in screen coordinates, excluding title bar and borders."""
+        try:
+            # GetClientRect returns (0, 0, width, height) relative to client area
+            client_rect = win32gui.GetClientRect(hwnd)
+            # ClientToScreen converts client (0,0) to screen coordinates
+            client_origin = win32gui.ClientToScreen(hwnd, (0, 0))
+            left = client_origin[0]
+            top = client_origin[1]
+            width = client_rect[2]
+            height = client_rect[3]
+            if width > 0 and height > 0:
+                return (max(0, left), max(0, top), width, height)
+        except Exception as e:
+            logger.debug("GetClientRect failed: %s", e)
+        return None
+
     def _find_window_win32(self) -> Optional[Tuple[int, int, int, int]]:
-        """Find window on Windows using win32gui."""
+        """Find window on Windows using win32gui.
+
+        Prefers actual table windows over lobby/generic PokerStars windows.
+        Uses the client area (excluding title bar) for accurate region mapping.
+        """
         if not HAS_WIN32:
             logger.warning("pywin32 not installed - cannot auto-detect window")
             return None
 
-        result = []
+        # Collect table windows and generic PokerStars windows separately
+        table_windows = []
+        generic_windows = []
 
         def enum_callback(hwnd, _):
-            if win32gui.IsWindowVisible(hwnd):
-                title = win32gui.GetWindowText(hwnd)
-                if (self.window_title.lower() in title.lower() or
-                        self._is_pokerstars_window(title)):
-                    # Use DWM to get actual visible bounds (excludes shadow)
-                    dwm_rect = ScreenCapture._get_dwm_frame_rect(hwnd)
-                    if dwm_rect:
-                        result.append(dwm_rect)
-                    else:
-                        # Fallback: clamp negative coords from GetWindowRect
-                        rect = win32gui.GetWindowRect(hwnd)
-                        left, top, right, bottom = rect
-                        adj_left = max(0, left)
-                        adj_top = max(0, top)
-                        result.append((adj_left, adj_top,
-                                       right - adj_left, bottom - adj_top))
+            if not win32gui.IsWindowVisible(hwnd):
+                return
+            title = win32gui.GetWindowText(hwnd)
+            if not title:
+                return
+
+            is_table = self._is_pokerstars_table(title)
+            is_generic = self.window_title.lower() in title.lower()
+
+            if not is_table and not is_generic:
+                return
+
+            # Prefer client area (excludes title bar) for accurate region mapping
+            rect = ScreenCapture._get_client_rect(hwnd)
+            if rect is None:
+                # Fallback: DWM frame bounds (excludes shadow but includes title bar)
+                rect = ScreenCapture._get_dwm_frame_rect(hwnd)
+            if rect is None:
+                # Last resort: GetWindowRect with clamping
+                wr = win32gui.GetWindowRect(hwnd)
+                left, top, right, bottom = wr
+                adj_left = max(0, left)
+                adj_top = max(0, top)
+                rect = (adj_left, adj_top, right - adj_left, bottom - adj_top)
+
+            if is_table:
+                table_windows.append((rect, title))
+                logger.debug("Found table window: '%s' at %s", title, rect)
+            elif is_generic:
+                generic_windows.append((rect, title))
+                logger.debug("Found generic PokerStars window: '%s' at %s", title, rect)
 
         win32gui.EnumWindows(enum_callback, None)
 
-        if result:
-            self._window_rect = result[0]
-            logger.info("Found PokerStars window at %s", self._window_rect)
+        # Prefer table windows over lobby/generic windows
+        if table_windows:
+            self._window_rect, title = table_windows[0]
+            logger.info("Found PokerStars table at %s ('%s')", self._window_rect, title)
+            return self._window_rect
+
+        if generic_windows:
+            self._window_rect, title = generic_windows[0]
+            logger.info("Found PokerStars window at %s ('%s') "
+                        "(no table window found - may be lobby)",
+                        self._window_rect, title)
             return self._window_rect
 
         logger.debug("PokerStars window not found")

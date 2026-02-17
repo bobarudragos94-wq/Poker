@@ -10,6 +10,11 @@ from typing import Optional, List, Dict, Tuple
 
 import numpy as np
 
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
 from .capture import ScreenCapture
 from .ocr import OCRReader
 from .card_detector import CardDetector, Card
@@ -178,12 +183,22 @@ class TableStateReader:
         # Read hero's cards
         state.hero_cards = self._read_hero_cards(table_img)
         if not state.hero_cards:
-            # Log at INFO every 20th call to avoid spam
             self._no_cards_count = getattr(self, '_no_cards_count', 0) + 1
             if self._no_cards_count <= 3 or self._no_cards_count % 20 == 0:
+                # Log detailed diagnostics for the hero card regions
+                diag = self._diagnose_hero_region(table_img)
                 logger.info("No hero cards detected (image %dx%d, attempt #%d) "
+                            "- %s "
                             "- use 'Save Debug Screenshot' to check region alignment",
-                            w_img, h_img, self._no_cards_count)
+                            w_img, h_img, self._no_cards_count, diag)
+
+            # After many consecutive failures, the window may be wrong (e.g.,
+            # lobby captured instead of table).  Force re-detection.
+            if self._no_cards_count >= 30:
+                logger.info("Hero cards not found after %d attempts - "
+                            "re-detecting window...", self._no_cards_count)
+                self.capture.invalidate_window()
+                self._no_cards_count = 0
         else:
             self._no_cards_count = 0
 
@@ -258,6 +273,34 @@ class TableStateReader:
                 if card:
                     cards.append(card)
         return cards
+
+    def _diagnose_hero_region(self, img: np.ndarray) -> str:
+        """Return a short diagnostic string about the hero card region contents."""
+        try:
+            if cv2 is None:
+                return "cv2 unavailable"
+            h_img, w_img = img.shape[:2]
+            region = self.regions.hero_card1
+            x, y, w, h = self._scale_region(region, w_img, h_img)
+            card_img = self._crop_region(img, region)
+            if card_img is None:
+                return f"region ({x},{y},{w},{h}) out of bounds"
+            hsv = cv2.cvtColor(card_img, cv2.COLOR_BGR2HSV)
+            avg_h = float(np.mean(hsv[:, :, 0]))
+            avg_s = float(np.mean(hsv[:, :, 1]))
+            avg_v = float(np.mean(hsv[:, :, 2]))
+            # Check how much is white vs green
+            white_mask = cv2.inRange(hsv, np.array([0, 0, 170]),
+                                     np.array([180, 60, 255]))
+            green_mask = cv2.inRange(hsv, np.array([30, 40, 40]),
+                                     np.array([90, 255, 200]))
+            white_pct = np.sum(white_mask > 0) / white_mask.size * 100
+            green_pct = np.sum(green_mask > 0) / green_mask.size * 100
+            return (f"region ({x},{y},{w},{h}) "
+                    f"avgHSV=({avg_h:.0f},{avg_s:.0f},{avg_v:.0f}) "
+                    f"white={white_pct:.0f}% green={green_pct:.0f}%")
+        except Exception as e:
+            return f"diag error: {e}"
 
     def _read_board_cards(self, img: np.ndarray) -> List[Card]:
         """Read community cards (flop, turn, river)."""
@@ -502,8 +545,3 @@ class TableStateReader:
 
         self._last_state = state
         return state
-
-try:
-    import cv2
-except ImportError:
-    cv2 = None

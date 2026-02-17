@@ -210,27 +210,63 @@ class OCRReader:
         """
         Read blind level from the table header.
         Returns (small_blind, big_blind, ante) or None.
-        Formats: "100/200" or "100/200 ante 25" or "Level 5: 100/200/25"
+
+        Common tournament formats:
+          "100/200"
+          "100/200 ante 25"
+          "Level 5: 100/200"
+          "Level 5: 100/200/25"
+          "Blinds 100/200 Ante 25"
         """
         text = self.read_text(img, whitelist="0123456789/: anteLevelBblid")
 
         if not text:
             return None
 
-        # Extract numbers from the text
-        numbers = re.findall(r'[\d,]+', text.replace(",", ""))
+        logger.debug("Blind OCR text: '%s'", text)
 
+        # Strategy 1: look for explicit "X/Y" or "X/Y/Z" pattern (most reliable)
+        slash_match = re.search(r'(\d[\d,]*)\s*/\s*(\d[\d,]*)(?:\s*/\s*(\d[\d,]*))?', text)
+        if slash_match:
+            try:
+                sb = float(slash_match.group(1).replace(",", ""))
+                bb = float(slash_match.group(2).replace(",", ""))
+                ante = float(slash_match.group(3).replace(",", "")) if slash_match.group(3) else 0
+                # Sanity: sb should be <= bb
+                if sb > bb:
+                    sb, bb = bb, sb
+                # Check for separate "ante N" after the slash pattern
+                if ante == 0:
+                    ante_match = re.search(r'ante\s*(\d[\d,]*)', text, re.IGNORECASE)
+                    if ante_match:
+                        ante = float(ante_match.group(1).replace(",", ""))
+                return (sb, bb, ante)
+            except (ValueError, IndexError):
+                pass
+
+        # Strategy 2: extract all numbers and use heuristics
+        numbers = re.findall(r'\d[\d,]*', text.replace(",", ""))
         if len(numbers) >= 2:
             try:
-                sb = float(numbers[-3]) if len(numbers) >= 3 else float(numbers[0])
-                bb = float(numbers[-2]) if len(numbers) >= 3 else float(numbers[1])
-                ante = float(numbers[-1]) if len(numbers) >= 3 else 0
-                # Heuristic: if 3 numbers and last is much smaller, it's ante
-                if len(numbers) >= 3 and ante > bb:
-                    sb = float(numbers[0])
-                    bb = float(numbers[1])
-                    ante = float(numbers[2]) if len(numbers) > 2 else 0
-                return (sb, bb, ante)
+                # Skip leading "Level N" — the level number is typically small
+                # compared to the actual blind values
+                vals = [float(n) for n in numbers]
+
+                # If first number is much smaller than the rest, it's likely "Level N"
+                if len(vals) >= 3 and vals[0] < vals[1] * 0.1:
+                    vals = vals[1:]
+
+                if len(vals) >= 2:
+                    sb = vals[0]
+                    bb = vals[1]
+                    ante = 0.0
+                    # Third number: ante if it's smaller than bb
+                    if len(vals) >= 3 and vals[2] < bb:
+                        ante = vals[2]
+                    # Sanity: sb should be <= bb
+                    if sb > bb:
+                        sb, bb = bb, sb
+                    return (sb, bb, ante)
             except (ValueError, IndexError):
                 pass
 

@@ -156,22 +156,48 @@ class CardDetector:
         """
         Check if a card is present in the image region.
         Cards are white/light colored; empty spaces are green felt.
+        Uses multiple strategies to handle different PokerStars themes.
         """
         if cv2 is None or img is None:
             return False
 
-        # Convert to HSV
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
-        # Check for white/light pixels (card background)
-        # Cards are mostly white with S < 50 and V > 180
-        lower_white = np.array([0, 0, 180])
-        upper_white = np.array([180, 50, 255])
-        mask = cv2.inRange(hsv, lower_white, upper_white)
+        # Strategy 1: Check for white/light pixels (card background)
+        # Cards are mostly white with low saturation and high value
+        lower_white = np.array([0, 0, 170])
+        upper_white = np.array([180, 60, 255])
+        white_mask = cv2.inRange(hsv, lower_white, upper_white)
+        white_ratio = np.sum(white_mask > 0) / white_mask.size
 
-        white_ratio = np.sum(mask > 0) / mask.size
-        logger.debug("Card presence check: white_ratio=%.3f (threshold=0.15)", white_ratio)
-        return white_ratio > 0.15  # At least 15% white pixels = card present
+        if white_ratio > 0.10:
+            logger.debug("Card present (white): ratio=%.3f", white_ratio)
+            return True
+
+        # Strategy 2: Check that this is NOT green felt.
+        # If a card is present, the region won't be mostly green.
+        # Green felt: H=35-85, S>40, V=40-200
+        lower_green = np.array([30, 40, 40])
+        upper_green = np.array([90, 255, 200])
+        green_mask = cv2.inRange(hsv, lower_green, upper_green)
+        green_ratio = np.sum(green_mask > 0) / green_mask.size
+
+        # If region is mostly NOT green felt, a card may be present
+        # (handles dark/colored card themes)
+        if green_ratio < 0.20:
+            # Additionally check for some light or colored content (not just dark/empty)
+            lower_light = np.array([0, 0, 100])
+            upper_light = np.array([180, 255, 255])
+            light_mask = cv2.inRange(hsv, lower_light, upper_light)
+            light_ratio = np.sum(light_mask > 0) / light_mask.size
+
+            if light_ratio > 0.25:
+                logger.debug("Card present (non-green): green=%.3f light=%.3f",
+                             green_ratio, light_ratio)
+                return True
+
+        logger.debug("No card present: white=%.3f green=%.3f", white_ratio, green_ratio)
+        return False
 
     def _detect_rank(self, img: np.ndarray) -> Optional[str]:
         """Detect the rank of a card using OCR on the top-left corner."""
