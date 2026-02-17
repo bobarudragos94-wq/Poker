@@ -90,6 +90,11 @@ a = Analysis(
         "pytesseract",
         "mss",
         "mss.tools",
+        # Windows window detection (pywin32)
+        "win32gui",
+        "win32con",
+        "win32api",
+        "pywintypes",
     ],
     hookspath=[],
     hooksconfig={},
