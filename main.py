@@ -24,12 +24,27 @@ from config import AppConfig
 
 
 def setup_logging(verbose: bool = False):
-    """Configure logging."""
+    """Configure logging to both console and a log file next to the executable."""
     level = logging.DEBUG if verbose else logging.INFO
+
+    # Determine log file location (next to executable for bundled builds)
+    if getattr(sys, "frozen", False):
+        log_dir = os.path.dirname(sys.executable)
+    else:
+        log_dir = os.path.dirname(os.path.abspath(__file__))
+    log_file = os.path.join(log_dir, "poker_gto_assistant.log")
+
+    handlers = [logging.StreamHandler()]
+    try:
+        handlers.append(logging.FileHandler(log_file, mode="w", encoding="utf-8"))
+    except OSError:
+        pass  # If log file can't be created, continue with console only
+
     logging.basicConfig(
         level=level,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
+        handlers=handlers,
     )
 
 
@@ -132,6 +147,18 @@ def main():
 
     args = parser.parse_args()
     setup_logging(args.verbose)
+
+    # Log startup diagnostics
+    log = logging.getLogger(__name__)
+    log.info("Poker GTO Assistant starting (platform=%s, frozen=%s)",
+             sys.platform, getattr(sys, "frozen", False))
+    if sys.platform == "win32":
+        try:
+            import win32gui  # noqa: F401
+            log.info("win32gui loaded OK - window detection available")
+        except ImportError:
+            log.error("win32gui NOT available - cannot detect PokerStars window! "
+                      "Install pywin32: pip install pywin32")
 
     if args.manual:
         run_manual_mode()

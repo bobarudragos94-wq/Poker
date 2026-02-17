@@ -14,5 +14,5 @@ pytesseract>=0.3.10
 # NumPy for image arrays
 numpy>=1.24.0
 
-# Windows-only: window detection (optional)
-# pywin32>=306; sys_platform == "win32"
+# Windows-only: window detection (required for auto-scan on Windows)
+pywin32>=306; sys_platform == "win32"
