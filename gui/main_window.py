@@ -196,6 +196,16 @@ class MainWindow(QMainWindow):
 
         scan_layout.addLayout(btn_layout)
 
+        # Debug screenshot button
+        self.debug_btn = QPushButton("Save Debug Screenshot")
+        self.debug_btn.setToolTip(
+            "Captures the table and saves an image showing where all\n"
+            "detection regions are. Use this to check if regions are\n"
+            "aligned with your PokerStars table layout."
+        )
+        self.debug_btn.clicked.connect(self._save_debug_screenshot)
+        scan_layout.addWidget(self.debug_btn)
+
         # Status
         self.scan_status = QLabel("Status: Idle")
         self.scan_status.setStyleSheet("color: #7f8c8d; padding: 5px;")
@@ -309,6 +319,26 @@ class MainWindow(QMainWindow):
         logger.info(message)
 
     # === Auto Scan ===
+
+    def _save_debug_screenshot(self):
+        """Save a debug screenshot showing all region overlays."""
+        import os
+        # Find the window first if not found
+        if not self.table_reader.capture.is_window_found():
+            self.table_reader.capture.window_title = self.window_title_input.text()
+            self.table_reader.capture.find_window()
+            if not self.table_reader.capture.is_window_found():
+                self._log("Cannot save debug screenshot: PokerStars window not found.")
+                return
+
+        # Save next to the executable / working directory
+        path = os.path.join(os.getcwd(), "debug_regions.png")
+        result = self.table_reader.save_debug_screenshot(path)
+        if result:
+            self._log(f"Debug screenshot saved: {result}")
+            self._log("Open this image to check if the colored boxes align with your table.")
+        else:
+            self._log("Failed to save debug screenshot (check logs).")
 
     def _start_scanning(self):
         """Start automatic screen scanning."""

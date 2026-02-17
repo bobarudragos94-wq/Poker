@@ -170,6 +170,7 @@ class CardDetector:
         mask = cv2.inRange(hsv, lower_white, upper_white)
 
         white_ratio = np.sum(mask > 0) / mask.size
+        logger.debug("Card presence check: white_ratio=%.3f (threshold=0.15)", white_ratio)
         return white_ratio > 0.15  # At least 15% white pixels = card present
 
     def _detect_rank(self, img: np.ndarray) -> Optional[str]:
