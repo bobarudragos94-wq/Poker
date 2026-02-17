@@ -178,7 +178,14 @@ class TableStateReader:
         # Read hero's cards
         state.hero_cards = self._read_hero_cards(table_img)
         if not state.hero_cards:
-            logger.debug("No hero cards detected (image %dx%d)", w_img, h_img)
+            # Log at INFO every 20th call to avoid spam
+            self._no_cards_count = getattr(self, '_no_cards_count', 0) + 1
+            if self._no_cards_count <= 3 or self._no_cards_count % 20 == 0:
+                logger.info("No hero cards detected (image %dx%d, attempt #%d) "
+                            "- use 'Save Debug Screenshot' to check region alignment",
+                            w_img, h_img, self._no_cards_count)
+        else:
+            self._no_cards_count = 0
 
         # Read board cards
         state.board_cards = self._read_board_cards(table_img)
@@ -360,6 +367,59 @@ class TableStateReader:
         if action_img is not None:
             return self.ocr.detect_action_buttons(action_img)
         return {}
+
+    def save_debug_screenshot(self, path: str = "debug_regions.png") -> Optional[str]:
+        """
+        Capture the table and save an image with all defined regions drawn
+        as colored rectangles, so the user can verify region alignment.
+        Returns the path on success, None on failure.
+        """
+        try:
+            import cv2
+        except ImportError:
+            logger.error("cv2 not available for debug screenshot")
+            return None
+
+        table_img = self.capture.capture_full_table()
+        if table_img is None:
+            logger.error("Cannot capture table for debug screenshot")
+            return None
+
+        h_img, w_img = table_img.shape[:2]
+        debug_img = table_img.copy()
+
+        # Define all regions with labels and colors (BGR)
+        region_defs = [
+            ("hero_card1", self.regions.hero_card1, (0, 255, 0)),    # Green
+            ("hero_card2", self.regions.hero_card2, (0, 255, 0)),
+            ("board1", self.regions.board_card1, (255, 255, 0)),     # Cyan
+            ("board2", self.regions.board_card2, (255, 255, 0)),
+            ("board3", self.regions.board_card3, (255, 255, 0)),
+            ("board4", self.regions.board_card4, (255, 255, 0)),
+            ("board5", self.regions.board_card5, (255, 255, 0)),
+            ("pot", self.regions.pot_area, (0, 165, 255)),           # Orange
+            ("blinds", self.regions.blind_info, (255, 0, 255)),      # Magenta
+            ("actions", self.regions.action_buttons, (0, 255, 255)), # Yellow
+        ]
+        # Player stacks
+        for seat, region in self.regions.player_stacks.items():
+            region_defs.append((f"stack{seat}", region, (255, 128, 0)))
+        # Player bets
+        for seat, region in self.regions.player_bets.items():
+            region_defs.append((f"bet{seat}", region, (128, 0, 255)))
+        # Dealer positions
+        for seat, region in self.regions.dealer_positions.items():
+            region_defs.append((f"D{seat}", region, (0, 128, 255)))
+
+        for label, region, color in region_defs:
+            x, y, w, h = self._scale_region(region, w_img, h_img)
+            cv2.rectangle(debug_img, (x, y), (x + w, y + h), color, 2)
+            cv2.putText(debug_img, label, (x, y - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
+        cv2.imwrite(path, debug_img)
+        logger.info("Debug screenshot saved to %s (%dx%d)", path, w_img, h_img)
+        return path
 
     @staticmethod
     def _scale_region(region: Tuple[int, int, int, int],
