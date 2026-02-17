@@ -22,7 +22,7 @@ jobs:
             artifact: PokerGTOAssistant-windows-x64
           - os: ubuntu-22.04
             artifact: PokerGTOAssistant-linux-x64
-          - os: macos-13
+          - os: macos-14
             artifact: PokerGTOAssistant-macos-x64
 
     runs-on: ${{ matrix.os }}
@@ -38,12 +38,28 @@ jobs:
       # --- Install Tesseract ---
       - name: Install Tesseract (Windows)
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
           choco install tesseract --no-progress -y
+          refreshenv
           # Verify installation and show paths for debugging
-          where tesseract
-          tesseract --version
-          dir "C:\Program Files\Tesseract-OCR\tessdata" 2>nul || echo "tessdata not at Program Files"
+          $tess = Get-Command tesseract -ErrorAction SilentlyContinue
+          if ($tess) {
+            Write-Host "Tesseract found at: $($tess.Source)"
+            & tesseract --version
+            $tessDir = Split-Path $tess.Source
+            $tessdata = Join-Path $tessDir "tessdata"
+            if (Test-Path $tessdata) {
+              Write-Host "tessdata contents:"
+              Get-ChildItem $tessdata
+            } else {
+              Write-Host "WARNING: tessdata not found at $tessdata"
+            }
+          } else {
+            Write-Host "WARNING: tesseract not found on PATH after install"
+            # Show where choco installed it
+            Get-ChildItem "C:\Program Files\Tesseract-OCR" -ErrorAction SilentlyContinue
+          }
 
       - name: Install Tesseract (Linux)
         if: runner.os == 'Linux'
