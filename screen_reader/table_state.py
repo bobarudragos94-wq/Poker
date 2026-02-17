@@ -318,13 +318,15 @@ class TableStateReader:
 
         h_img, w_img = img.shape[:2]
 
-        # Search area: center 40% of width, 52-75% from top.
-        # Deliberately stops ABOVE the player name / stack area (~75-80%)
-        # to avoid white text contours merging with card contours.
-        sx1 = int(w_img * 0.30)
-        sx2 = int(w_img * 0.70)
-        sy1 = int(h_img * 0.52)
-        sy2 = int(h_img * 0.75)
+        # Search area: center 50% of width, 40-72% from top.
+        # On a 1920x1111 PokerStars table the hero cards sit at ~47-52%
+        # of the client-area height.  The player name/stack text sits at
+        # ~53-57%, so ending at 72% includes some text — the morphological
+        # filtering and contour-size checks handle the separation.
+        sx1 = int(w_img * 0.25)
+        sx2 = int(w_img * 0.75)
+        sy1 = int(h_img * 0.40)
+        sy2 = int(h_img * 0.72)
         search = img[sy1:sy2, sx1:sx2]
 
         if search.size == 0:
@@ -387,12 +389,18 @@ class TableStateReader:
                             w_img: int, h_img: int,
                             tag: str = "") -> List[Card]:
         """Find card-shaped contours in a binary mask and detect cards."""
-        # Morphological cleanup — use 5x5 kernel to bridge small gaps
-        # between the white card background and the rank/suit graphics.
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
-        kernel_sm = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_sm)
+        # Morphological cleanup:
+        # 1. CLOSE with a HORIZONTAL kernel (9x3) to bridge gaps within the
+        #    card face (between rank, suit, and white background) WITHOUT
+        #    bridging vertically to the player-name text ~10px below.
+        # 2. CLOSE with a small square kernel to fill remaining gaps.
+        # 3. OPEN with 5x5 to remove small noise and thin text lines.
+        kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_h, iterations=2)
+        kernel_sq = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_sq, iterations=1)
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
                                         cv2.CHAIN_APPROX_SIMPLE)
@@ -429,9 +437,9 @@ class TableStateReader:
                 if 0.3 <= aspect <= 1.5:
                     merged_rects.append((bx + sx1, by + sy1, bw, bh))
 
-        logger.debug("Adaptive [%s]: %d contours, %d single, %d partial, %d merged",
-                     tag, len(contours), len(single_rects),
-                     len(partial_rects), len(merged_rects))
+        logger.info("Adaptive [%s]: %d contours, %d single, %d partial, %d merged",
+                    tag, len(contours), len(single_rects),
+                    len(partial_rects), len(merged_rects))
 
         center_x = w_img / 2
 
@@ -570,10 +578,10 @@ class TableStateReader:
             h_img, w_img = img.shape[:2]
 
             # Save the wide search area (same region as adaptive scanner)
-            sx1 = int(w_img * 0.30)
-            sx2 = int(w_img * 0.70)
-            sy1 = int(h_img * 0.52)
-            sy2 = int(h_img * 0.75)
+            sx1 = int(w_img * 0.25)
+            sx2 = int(w_img * 0.75)
+            sy1 = int(h_img * 0.40)
+            sy2 = int(h_img * 0.72)
             search_crop = img[sy1:sy2, sx1:sx2].copy()
 
             # Draw fixed-region rectangles on the search crop for comparison

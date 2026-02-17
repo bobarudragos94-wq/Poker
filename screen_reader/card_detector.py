@@ -24,9 +24,19 @@ logger = logging.getLogger(__name__)
 RANKS = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A']
 SUITS = ['s', 'h', 'd', 'c']  # spades, hearts, diamonds, clubs
 
-# PokerStars color ranges (HSV) for suit detection
-# These are calibrated for the default PokerStars theme
-SUIT_COLORS_HSV = {
+# PokerStars color ranges (HSV) for suit detection.
+#
+# 4-color deck (PokerStars default for online play):
+#   Spades = black, Hearts = red, Diamonds = BLUE, Clubs = GREEN
+#
+# 2-color deck (classic):
+#   Spades = black, Hearts = red, Diamonds = RED, Clubs = BLACK
+#
+# We detect all four 4-color ranges first.  If the best match is red we
+# disambiguate hearts vs diamonds using the suit symbol shape (see
+# ``_detect_suit``).  This handles both deck types.
+
+SUIT_COLORS_HSV_4COLOR = {
     's': {  # Spades - black/dark gray
         'lower': np.array([0, 0, 0]),
         'upper': np.array([180, 50, 80]),
@@ -34,18 +44,21 @@ SUIT_COLORS_HSV = {
     'h': {  # Hearts - red
         'lower': np.array([0, 100, 100]),
         'upper': np.array([10, 255, 255]),
-        'lower2': np.array([160, 100, 100]),  # Red wraps in HSV
+        'lower2': np.array([160, 100, 100]),
         'upper2': np.array([180, 255, 255]),
     },
-    'd': {  # Diamonds - blue
+    'd': {  # Diamonds - blue (4-color only)
         'lower': np.array([100, 80, 80]),
         'upper': np.array([130, 255, 255]),
     },
-    'c': {  # Clubs - green
+    'c': {  # Clubs - green (4-color only)
         'lower': np.array([35, 80, 80]),
         'upper': np.array([85, 255, 255]),
     },
 }
+
+# Backward-compatible alias
+SUIT_COLORS_HSV = SUIT_COLORS_HSV_4COLOR
 
 # Rank detection via OCR character mapping
 RANK_OCR_MAP = {
@@ -209,52 +222,67 @@ class CardDetector:
         return False
 
     def _detect_rank(self, img: np.ndarray) -> Optional[str]:
-        """Detect the rank of a card using OCR on the top-left corner."""
+        """Detect the rank of a card using OCR on the top-left corner.
+
+        Tries multiple preprocessing strategies to handle different card
+        styles, theme colours, and image qualities.
+        """
         if cv2 is None:
             return None
 
         h, w = img.shape[:2]
+        if h < 10 or w < 10:
+            return None
 
-        # The rank is in the top-left corner of the card
-        # Crop to approximately the top-left 40% x 35%
-        rank_region = img[2:int(h * 0.35), 2:int(w * 0.40)]
+        # The rank character is printed in the top-left corner of the card.
+        # Crop generously to ensure the character is included even if the
+        # contour bounding box is slightly off.
+        rank_region = img[1:int(h * 0.40), 1:int(w * 0.45)]
 
         if rank_region.size == 0:
             return None
 
-        # Preprocess: convert to grayscale, threshold
         gray = cv2.cvtColor(rank_region, cv2.COLOR_BGR2GRAY)
 
-        # Scale up
-        gray = cv2.resize(gray, (gray.shape[1] * 3, gray.shape[0] * 3),
+        # Scale up for better OCR accuracy
+        scale = max(3, 60 // max(gray.shape[0], 1))  # aim for ~60px tall
+        gray = cv2.resize(gray, (gray.shape[1] * scale, gray.shape[0] * scale),
                           interpolation=cv2.INTER_CUBIC)
 
-        # Threshold to get dark text on white card
-        _, binary = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY_INV)
-
-        # Use OCR to read the rank character
+        # Try multiple thresholding strategies — the card background can be
+        # white (standard) or tinted (themed tables).
         ocr = self._get_ocr()
-        text = ocr.read_text(binary, whitelist="23456789TJQKA10", preprocess=False)
-        text = text.strip().upper()
+        for thresh_method in ("otsu", "fixed_low", "fixed_high"):
+            if thresh_method == "otsu":
+                _, binary = cv2.threshold(gray, 0, 255,
+                                          cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            elif thresh_method == "fixed_low":
+                _, binary = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY_INV)
+            else:
+                _, binary = cv2.threshold(gray, 160, 255, cv2.THRESH_BINARY_INV)
 
-        # Map OCR result to rank
-        if text in RANK_OCR_MAP:
-            return RANK_OCR_MAP[text]
+            text = ocr.read_text(binary, whitelist="23456789TJQKA10",
+                                 preprocess=False)
+            text = text.strip().upper()
 
-        # Try first character only
-        if text and text[0] in RANK_OCR_MAP:
-            return RANK_OCR_MAP[text[0]]
+            if text in RANK_OCR_MAP:
+                return RANK_OCR_MAP[text]
+            if text and text[0] in RANK_OCR_MAP:
+                return RANK_OCR_MAP[text[0]]
 
+        logger.debug("Rank OCR failed on %dx%d region", w, h)
         return None
 
     def _detect_suit(self, img: np.ndarray) -> Optional[str]:
         """
         Detect the suit of a card using color analysis.
-        PokerStars uses colored suit symbols:
-        - Spades: black
-        - Hearts: red
-        - Diamonds: blue
-        - Clubs: green
+
+        Works with both 4-color and 2-color decks:
+        - 4-color: Spades=black, Hearts=red, Diamonds=BLUE, Clubs=GREEN
+        - 2-color: Spades=black, Hearts=red, Diamonds=RED,  Clubs=BLACK
+
+        For the 2-color deck, red suits (hearts/diamonds) and black suits
+        (spades/clubs) are distinguished by the shape of the suit symbol.
         """
         if cv2 is None:
             return None
@@ -262,7 +290,6 @@ class CardDetector:
         h, w = img.shape[:2]
 
         # The suit symbol is below the rank, in the top portion
-        # Look at the area below the rank text
         suit_region = img[int(h * 0.25):int(h * 0.55), 2:int(w * 0.45)]
 
         if suit_region.size == 0:
@@ -270,10 +297,9 @@ class CardDetector:
 
         hsv = cv2.cvtColor(suit_region, cv2.COLOR_BGR2HSV)
 
-        # Count pixels matching each suit color
+        # Count pixels matching each 4-color suit
         suit_scores = {}
-
-        for suit, color_range in SUIT_COLORS_HSV.items():
+        for suit, color_range in SUIT_COLORS_HSV_4COLOR.items():
             mask = cv2.inRange(hsv, color_range['lower'], color_range['upper'])
             if 'lower2' in color_range:
                 mask2 = cv2.inRange(hsv, color_range['lower2'], color_range['upper2'])
@@ -281,11 +307,92 @@ class CardDetector:
             suit_scores[suit] = np.sum(mask > 0)
 
         if not suit_scores or max(suit_scores.values()) == 0:
-            # Fallback: detect based on average color of non-white pixels
             return self._detect_suit_by_average_color(suit_region)
 
         best_suit = max(suit_scores, key=suit_scores.get)
+
+        # If the best match is red (hearts) but blue/green scored zero,
+        # the user likely has a 2-color deck.  Try to distinguish hearts
+        # from diamonds using the shape of the suit symbol.
+        if best_suit == 'h' and suit_scores.get('d', 0) == 0 and suit_scores.get('c', 0) == 0:
+            shape_suit = self._detect_suit_by_shape(suit_region)
+            if shape_suit in ('h', 'd'):
+                best_suit = shape_suit
+
+        # Similarly, if black is dominant and no green/blue was found,
+        # try to distinguish spades from clubs by shape.
+        if best_suit == 's' and suit_scores.get('d', 0) == 0 and suit_scores.get('c', 0) == 0:
+            shape_suit = self._detect_suit_by_shape(suit_region)
+            if shape_suit in ('s', 'c'):
+                best_suit = shape_suit
+
         return best_suit
+
+    def _detect_suit_by_shape(self, suit_region: np.ndarray) -> Optional[str]:
+        """
+        Distinguish suits by the shape of the suit symbol.
+        Used for 2-color decks where hearts/diamonds are both red
+        and spades/clubs are both black.
+
+        Shape heuristics:
+        - Hearts (♥): wider at top, pointed at bottom → more pixels in top half
+        - Diamonds (♦): pointed at top and bottom → vertically symmetric
+        - Spades (♠): pointed at top, wider at bottom → more pixels in bottom half
+        - Clubs (♣): three lobes → roughly symmetric with wider top
+        """
+        if cv2 is None:
+            return None
+
+        gray = cv2.cvtColor(suit_region, cv2.COLOR_BGR2GRAY)
+        # Isolate non-white pixels (the suit symbol itself)
+        _, mask = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
+
+        h, w = mask.shape
+        if h < 4 or w < 4:
+            return None
+
+        total = np.sum(mask > 0)
+        if total < 10:
+            return None
+
+        mid_y = h // 2
+        top_pixels = np.sum(mask[:mid_y, :] > 0)
+        bot_pixels = np.sum(mask[mid_y:, :] > 0)
+
+        # Vertical symmetry: ratio of top-half to bottom-half pixels
+        if total > 0:
+            top_ratio = top_pixels / total
+        else:
+            return None
+
+        # Check horizontal extent of the widest row in top vs bottom
+        top_widths = [np.sum(mask[r, :] > 0) for r in range(mid_y)]
+        bot_widths = [np.sum(mask[r, :] > 0) for r in range(mid_y, h)]
+        max_top_w = max(top_widths) if top_widths else 0
+        max_bot_w = max(bot_widths) if bot_widths else 0
+
+        # Detect suit color (red or black) to narrow candidates
+        hsv = cv2.cvtColor(suit_region, cv2.COLOR_BGR2HSV)
+        red_mask = cv2.inRange(hsv, np.array([0, 80, 80]), np.array([10, 255, 255]))
+        red_mask2 = cv2.inRange(hsv, np.array([160, 80, 80]), np.array([180, 255, 255]))
+        is_red = (np.sum(red_mask > 0) + np.sum(red_mask2 > 0)) > total * 0.3
+
+        if is_red:
+            # Hearts vs Diamonds
+            # ♥: wider at top → top_ratio > 0.5, max_top_w > max_bot_w
+            # ♦: symmetric diamond → top_ratio ≈ 0.5, max widths at center
+            if top_ratio > 0.55 or max_top_w > max_bot_w * 1.2:
+                return 'h'
+            else:
+                return 'd'
+        else:
+            # Spades vs Clubs
+            # ♠: pointed top, wide bottom → bot_pixels > top_pixels
+            # ♣: three lobes at top → top_pixels ≥ bot_pixels
+            if top_ratio > 0.45 and max_top_w >= max_bot_w:
+                return 'c'
+            else:
+                return 's'
 
     def _detect_suit_by_average_color(self, img: np.ndarray) -> Optional[str]:
         """Fallback suit detection using average color of the suit symbol."""
