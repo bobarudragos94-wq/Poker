@@ -13,7 +13,7 @@ import numpy as np
 from .capture import ScreenCapture
 from .ocr import OCRReader
 from .card_detector import CardDetector, Card
-from config import AppConfig, TableRegions
+from config import AppConfig, TableRegions, BASELINE_WIDTH, BASELINE_HEIGHT
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +167,11 @@ class TableStateReader:
         if table_img is None:
             logger.warning("Failed to capture table screenshot")
             return self._last_state
+
+        h_img, w_img = table_img.shape[:2]
+        logger.debug("Captured table image: %dx%d (baseline %dx%d, scale %.2fx%.2f)",
+                      w_img, h_img, BASELINE_WIDTH, BASELINE_HEIGHT,
+                      w_img / BASELINE_WIDTH, h_img / BASELINE_HEIGHT)
 
         state = GameState(timestamp=time.time())
 
@@ -355,10 +360,20 @@ class TableStateReader:
         return {}
 
     @staticmethod
-    def _crop_region(img: np.ndarray, region: Tuple[int, int, int, int]) -> Optional[np.ndarray]:
-        """Crop a region from the full table image."""
+    def _scale_region(region: Tuple[int, int, int, int],
+                      img_w: int, img_h: int) -> Tuple[int, int, int, int]:
+        """Scale a region from the 800x600 baseline to the actual image size."""
         x, y, w, h = region
+        sx = img_w / BASELINE_WIDTH
+        sy = img_h / BASELINE_HEIGHT
+        return (int(x * sx), int(y * sy), int(w * sx), int(h * sy))
+
+    @staticmethod
+    def _crop_region(img: np.ndarray, region: Tuple[int, int, int, int]) -> Optional[np.ndarray]:
+        """Crop a region from the full table image, scaling from baseline 800x600."""
         h_img, w_img = img.shape[:2]
+        # Scale region from baseline to actual image dimensions
+        x, y, w, h = TableStateReader._scale_region(region, w_img, h_img)
         # Clamp to image boundaries
         x = max(0, min(x, w_img - 1))
         y = max(0, min(y, h_img - 1))
