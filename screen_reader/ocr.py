@@ -50,11 +50,18 @@ def _configure_bundled_tesseract():
 
     if os.path.isfile(tess_exe):
         pytesseract.pytesseract.tesseract_cmd = tess_exe
-        # Point TESSDATA_PREFIX so Tesseract finds its language files
+        # Point TESSDATA_PREFIX to the folder containing eng.traineddata.
+        # Tesseract 5.x looks for *.traineddata directly in TESSDATA_PREFIX,
+        # while 4.x appends /tessdata automatically — set to the tessdata
+        # dir itself to work with both versions.
         tessdata = os.path.join(tess_dir, "tessdata")
         if os.path.isdir(tessdata):
+            os.environ["TESSDATA_PREFIX"] = tessdata
+        elif os.path.isfile(os.path.join(tess_dir, "eng.traineddata")):
+            # Fallback: traineddata files sitting directly in tess_dir
             os.environ["TESSDATA_PREFIX"] = tess_dir
-        logger.info("Using bundled Tesseract: %s", tess_exe)
+        logger.info("Using bundled Tesseract: %s (TESSDATA_PREFIX=%s)",
+                     tess_exe, os.environ.get("TESSDATA_PREFIX", "<not set>"))
 
 
 _configure_bundled_tesseract()

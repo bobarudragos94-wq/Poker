@@ -13,6 +13,11 @@ import os
 Region = Tuple[int, int, int, int]
 
 
+# Baseline resolution the default regions are calibrated for
+BASELINE_WIDTH = 800
+BASELINE_HEIGHT = 600
+
+
 @dataclass
 class TableRegions:
     """Screen regions for a 6-max PokerStars table (default 800x600 layout)."""
