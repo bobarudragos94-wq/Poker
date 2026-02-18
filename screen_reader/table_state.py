@@ -8,6 +8,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from collections import defaultdict
 from typing import Optional, List, Dict, Tuple
 
 import numpy as np
@@ -318,14 +319,14 @@ class TableStateReader:
 
         h_img, w_img = img.shape[:2]
 
-        # Search area: center 50% of width, 40-72% from top.
-        # On a 1920x1111 PokerStars table the hero cards sit at ~47-52%
-        # of the client-area height.  The player name/stack text sits at
-        # ~53-57%, so ending at 72% includes some text — the morphological
-        # filtering and contour-size checks handle the separation.
-        sx1 = int(w_img * 0.25)
-        sx2 = int(w_img * 0.75)
-        sy1 = int(h_img * 0.40)
+        # Search area: 20-80% width, 45-72% height.
+        # On a PokerStars table the community cards (flop/turn/river)
+        # sit at ~33-42% height and hero cards at ~47-55%.  Starting at
+        # 45% avoids picking up community cards by mistake.
+        # Width is 20-80% to cover hero positions on 5/6/9-max layouts.
+        sx1 = int(w_img * 0.20)
+        sx2 = int(w_img * 0.80)
+        sy1 = int(h_img * 0.45)
         sy2 = int(h_img * 0.72)
         search = img[sy1:sy2, sx1:sx2]
 
@@ -335,10 +336,13 @@ class TableStateReader:
         hsv = cv2.cvtColor(search, cv2.COLOR_BGR2HSV)
         best_cards = []
 
-        # --- HSV-based passes (strict, then relaxed) ---
+        # --- HSV-based passes (strict → relaxed) ---
+        # Some PokerStars themes render cards in muted gray tones rather
+        # than bright white, so we go as low as V>=80 / S<=150.
         threshold_sets = [
             (np.array([0, 0, 150]), np.array([180, 80, 255])),
             (np.array([0, 0, 100]), np.array([180, 120, 255])),
+            (np.array([0, 0, 80]),  np.array([180, 150, 255])),
         ]
 
         for lower, upper in threshold_sets:
@@ -349,11 +353,22 @@ class TableStateReader:
             if len(cards) > len(best_cards):
                 best_cards = cards
 
-        # --- Grayscale brightness pass ---
-        # Cards are bright objects on a dark table.  A simple brightness
-        # threshold avoids HSV saturation/hue issues entirely.
+        # --- Grayscale brightness passes ---
+        # Cards are brighter than the dark felt.  Multiple fixed thresholds
+        # plus an Otsu auto-threshold cover varied card/felt brightness.
         gray = cv2.cvtColor(search, cv2.COLOR_BGR2GRAY)
-        for thresh in (150, 120):
+
+        # Otsu auto-threshold (adapts to actual brightness distribution)
+        _, otsu_binary = cv2.threshold(gray, 0, 255,
+                                       cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        cards = self._gray_contour_pass(img, otsu_binary,
+                                        sx1, sy1, w_img, h_img)
+        if len(cards) == 2:
+            return cards
+        if len(cards) > len(best_cards):
+            best_cards = cards
+
+        for thresh in (150, 120, 90):
             _, binary = cv2.threshold(gray, thresh, 255, cv2.THRESH_BINARY)
             cards = self._gray_contour_pass(img, binary,
                                             sx1, sy1, w_img, h_img)
@@ -388,25 +403,44 @@ class TableStateReader:
                             sx1: int, sy1: int,
                             w_img: int, h_img: int,
                             tag: str = "") -> List[Card]:
-        """Find card-shaped contours in a binary mask and detect cards."""
-        # Morphological cleanup:
-        # 1. CLOSE with a HORIZONTAL kernel (9x3) to bridge gaps within the
-        #    card face (between rank, suit, and white background) WITHOUT
-        #    bridging vertically to the player-name text ~10px below.
-        # 2. CLOSE with a small square kernel to fill remaining gaps.
-        # 3. OPEN with 5x5 to remove small noise and thin text lines.
-        kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 3))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_h, iterations=2)
-        kernel_sq = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_sq, iterations=1)
-        kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
+        """Find card-shaped contours in a binary mask and detect cards.
+
+        Uses contour clustering (union-find) instead of aggressive morphological
+        bridging.  Card faces are fragmented into small white patches by the
+        printed rank, suit symbol and card pattern.  Morphological CLOSE can
+        bridge horizontal gaps but NOT the ~15-20 px vertical gaps created by
+        rank text without also bridging to the player-name text below.
+
+        Clustering approach:
+          1. Minimal CLOSE (3x3) to merge pixel-level noise.
+          2. OPEN (3x3) to remove tiny dots.
+          3. Find all contours → bounding boxes (≥ 5x5 px).
+          4. Group nearby boxes with union-find (max_gap_x=25, max_gap_y=20).
+          5. Use the bounding box of each cluster as a card candidate.
+        """
+        # --- Light morphological cleanup (noise only, no bridging) ---
+        kernel_sm = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_sm, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_sm, iterations=1)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
                                         cv2.CHAIN_APPROX_SIMPLE)
 
+        # Collect bounding boxes for non-tiny contours
+        boxes = []
+        for c in contours:
+            bx, by, bw, bh = cv2.boundingRect(c)
+            if bw >= 5 and bh >= 5:
+                boxes.append((bx, by, bw, bh))
+
+        # --- Cluster nearby boxes ---
+        # max_gap_x=25 bridges horizontal gaps (suit symbols, card edges)
+        # max_gap_y=20 bridges vertical gaps within a card (rank text ~15-20px)
+        #   but should NOT bridge to player-name text ~25-40px below card
+        clusters = self._cluster_boxes(boxes, max_gap_x=25, max_gap_y=20)
+
         # Expected card dimensions (proportional to full image)
-        card_min_w = w_img * 0.020    # slightly looser than before
+        card_min_w = w_img * 0.020
         card_max_w = w_img * 0.10
         card_min_h = h_img * 0.05
         card_max_h = h_img * 0.20
@@ -415,31 +449,31 @@ class TableStateReader:
         partial_rects = []  # Narrow rects (partially hidden card)
         merged_rects = []   # Two overlapping cards as one blob
 
-        for c in contours:
-            bx, by, bw, bh = cv2.boundingRect(c)
-            if bw < 15 or bh < card_min_h * 0.5:
+        for cx, cy, cw, ch in clusters:
+            if cw < 10 or ch < card_min_h * 0.4:
                 continue
 
-            aspect = bh / bw if bw > 0 else 0
+            aspect = ch / cw if cw > 0 else 0
 
             # Full single card: relaxed aspect 0.7-2.5
-            if card_min_w <= bw <= card_max_w and card_min_h <= bh <= card_max_h:
+            if card_min_w <= cw <= card_max_w and card_min_h <= ch <= card_max_h:
                 if 0.7 <= aspect <= 2.5:
-                    single_rects.append((bx + sx1, by + sy1, bw, bh))
+                    single_rects.append((cx + sx1, cy + sy1, cw, ch))
 
             # Partial card (left card hidden behind right card on PS)
-            if card_min_w * 0.3 <= bw < card_min_w and card_min_h * 0.7 <= bh <= card_max_h:
+            if card_min_w * 0.3 <= cw < card_min_w and card_min_h * 0.7 <= ch <= card_max_h:
                 if 1.0 <= aspect <= 4.0:
-                    partial_rects.append((bx + sx1, by + sy1, bw, bh))
+                    partial_rects.append((cx + sx1, cy + sy1, cw, ch))
 
             # Merged pair: wider blob
-            if bw > card_min_w * 1.2 and bh > card_min_h * 0.7:
+            if cw > card_min_w * 1.2 and ch > card_min_h * 0.7:
                 if 0.3 <= aspect <= 1.5:
-                    merged_rects.append((bx + sx1, by + sy1, bw, bh))
+                    merged_rects.append((cx + sx1, cy + sy1, cw, ch))
 
-        logger.info("Adaptive [%s]: %d contours, %d single, %d partial, %d merged",
-                    tag, len(contours), len(single_rects),
-                    len(partial_rects), len(merged_rects))
+        logger.info("Adaptive [%s]: %d contours -> %d boxes -> %d clusters | "
+                    "%d single, %d partial, %d merged",
+                    tag, len(contours), len(boxes), len(clusters),
+                    len(single_rects), len(partial_rects), len(merged_rects))
 
         center_x = w_img / 2
 
@@ -512,6 +546,62 @@ class TableStateReader:
 
         return best_pair
 
+    @staticmethod
+    def _cluster_boxes(boxes, max_gap_x=25, max_gap_y=20):
+        """Group nearby bounding boxes using union-find.
+
+        Two boxes belong to the same cluster when the horizontal gap
+        between their closest edges is <= *max_gap_x* AND the vertical
+        gap is <= *max_gap_y*.  Transitivity is handled by union-find,
+        so chains of overlapping/touching fragments naturally merge.
+
+        Returns a list of (x, y, w, h) bounding boxes — one per cluster.
+        """
+        n = len(boxes)
+        if n == 0:
+            return []
+
+        # --- Union-find with path compression ---
+        parent = list(range(n))
+
+        def find(a):
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        # Check all pairs for proximity (O(n²) is fine for n < 200)
+        for i in range(n):
+            x1, y1, w1, h1 = boxes[i]
+            for j in range(i + 1, n):
+                x2, y2, w2, h2 = boxes[j]
+                # Edge-to-edge gap (negative means overlap)
+                gap_x = max(0, max(x2 - (x1 + w1), x1 - (x2 + w2)))
+                gap_y = max(0, max(y2 - (y1 + h1), y1 - (y2 + h2)))
+                if gap_x <= max_gap_x and gap_y <= max_gap_y:
+                    union(i, j)
+
+        # Group boxes by cluster root
+        groups = defaultdict(list)
+        for i in range(n):
+            groups[find(i)].append(boxes[i])
+
+        # Bounding box of each cluster
+        result = []
+        for group in groups.values():
+            min_x = min(bx for bx, _, _, _ in group)
+            min_y = min(by for _, by, _, _ in group)
+            max_x = max(bx + bw for bx, _, bw, _ in group)
+            max_y = max(by + bh for _, by, _, bh in group)
+            result.append((min_x, min_y, max_x - min_x, max_y - min_y))
+
+        return result
+
     def _detect_cards_from_rects(self, img: np.ndarray,
                                   rects) -> List[Card]:
         """Detect cards from a sequence of (x, y, w, h) bounding rects."""
@@ -578,9 +668,9 @@ class TableStateReader:
             h_img, w_img = img.shape[:2]
 
             # Save the wide search area (same region as adaptive scanner)
-            sx1 = int(w_img * 0.25)
-            sx2 = int(w_img * 0.75)
-            sy1 = int(h_img * 0.40)
+            sx1 = int(w_img * 0.20)
+            sx2 = int(w_img * 0.80)
+            sy1 = int(h_img * 0.45)
             sy2 = int(h_img * 0.72)
             search_crop = img[sy1:sy2, sx1:sx2].copy()
 

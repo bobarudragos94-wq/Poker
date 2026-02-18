@@ -441,5 +441,60 @@ class TestTitleParsing:
         assert TableStateReader._parse_blinds_from_title("Google Chrome") is None
 
 
+class TestContourClustering:
+    """Tests for union-find contour clustering used in adaptive card detection."""
+
+    def test_cluster_overlapping_boxes(self):
+        from screen_reader.table_state import TableStateReader
+        # Two overlapping boxes should merge into one cluster
+        boxes = [(10, 10, 30, 40), (25, 10, 30, 40)]
+        clusters = TableStateReader._cluster_boxes(boxes)
+        assert len(clusters) == 1
+        cx, cy, cw, ch = clusters[0]
+        assert cx == 10 and cy == 10
+        assert cw == 45  # 25 + 30 - 10
+        assert ch == 40
+
+    def test_cluster_vertically_close_fragments(self):
+        from screen_reader.table_state import TableStateReader
+        # Fragments with 15px vertical gap (within max_gap_y=20)
+        boxes = [(10, 10, 30, 15), (10, 40, 30, 15)]  # 15px gap
+        clusters = TableStateReader._cluster_boxes(boxes, max_gap_y=20)
+        assert len(clusters) == 1
+
+    def test_no_cluster_distant_boxes(self):
+        from screen_reader.table_state import TableStateReader
+        # Two boxes far apart should stay separate
+        boxes = [(10, 10, 30, 30), (200, 10, 30, 30)]
+        clusters = TableStateReader._cluster_boxes(boxes)
+        assert len(clusters) == 2
+
+    def test_no_cluster_vertically_far(self):
+        from screen_reader.table_state import TableStateReader
+        # Boxes with vertical gap > max_gap_y should stay separate
+        boxes = [(10, 10, 30, 15), (10, 60, 30, 15)]  # 35px gap
+        clusters = TableStateReader._cluster_boxes(boxes, max_gap_y=20)
+        assert len(clusters) == 2
+
+    def test_transitive_clustering(self):
+        from screen_reader.table_state import TableStateReader
+        # Three fragments in a chain: A near B, B near C, A far from C
+        # Should all merge via transitivity
+        boxes = [(10, 10, 20, 20), (25, 10, 20, 20), (40, 10, 20, 20)]
+        clusters = TableStateReader._cluster_boxes(boxes)
+        assert len(clusters) == 1
+
+    def test_empty_boxes(self):
+        from screen_reader.table_state import TableStateReader
+        assert TableStateReader._cluster_boxes([]) == []
+
+    def test_single_box(self):
+        from screen_reader.table_state import TableStateReader
+        boxes = [(10, 10, 30, 40)]
+        clusters = TableStateReader._cluster_boxes(boxes)
+        assert len(clusters) == 1
+        assert clusters[0] == (10, 10, 30, 40)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
