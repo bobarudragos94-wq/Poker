@@ -441,59 +441,38 @@ class TestTitleParsing:
         assert TableStateReader._parse_blinds_from_title("Google Chrome") is None
 
 
-class TestContourClustering:
-    """Tests for union-find contour clustering used in adaptive card detection."""
+class TestCardRectFinding:
+    """Tests for contour-based card rectangle detection."""
 
-    def test_cluster_overlapping_boxes(self):
-        from screen_reader.table_state import TableStateReader
-        # Two overlapping boxes should merge into one cluster
-        boxes = [(10, 10, 30, 40), (25, 10, 30, 40)]
-        clusters = TableStateReader._cluster_boxes(boxes)
-        assert len(clusters) == 1
-        cx, cy, cw, ch = clusters[0]
-        assert cx == 10 and cy == 10
-        assert cw == 45  # 25 + 30 - 10
-        assert ch == 40
+    def test_find_rects_on_white_cards(self):
+        """White rectangles on green background should be found."""
+        import numpy as np
+        try:
+            import cv2
+        except ImportError:
+            return
+        from screen_reader.card_detector import CardDetector
 
-    def test_cluster_vertically_close_fragments(self):
-        from screen_reader.table_state import TableStateReader
-        # Fragments with 15px vertical gap (within max_gap_y=20)
-        boxes = [(10, 10, 30, 15), (10, 40, 30, 15)]  # 15px gap
-        clusters = TableStateReader._cluster_boxes(boxes, max_gap_y=20)
-        assert len(clusters) == 1
+        # Green background with two white rectangles
+        img = np.full((200, 300, 3), (40, 120, 30), dtype=np.uint8)
+        cv2.rectangle(img, (50, 50), (100, 120), (255, 255, 255), -1)
+        cv2.rectangle(img, (150, 50), (200, 120), (255, 255, 255), -1)
 
-    def test_no_cluster_distant_boxes(self):
-        from screen_reader.table_state import TableStateReader
-        # Two boxes far apart should stay separate
-        boxes = [(10, 10, 30, 30), (200, 10, 30, 30)]
-        clusters = TableStateReader._cluster_boxes(boxes)
-        assert len(clusters) == 2
+        rects = CardDetector.find_card_rectangles(
+            img, min_card_w=20, max_card_w=100,
+            min_card_h=30, max_card_h=150)
+        assert len(rects) >= 2
 
-    def test_no_cluster_vertically_far(self):
-        from screen_reader.table_state import TableStateReader
-        # Boxes with vertical gap > max_gap_y should stay separate
-        boxes = [(10, 10, 30, 15), (10, 60, 30, 15)]  # 35px gap
-        clusters = TableStateReader._cluster_boxes(boxes, max_gap_y=20)
-        assert len(clusters) == 2
+    def test_no_rects_on_solid_felt(self):
+        """Pure felt should return no rectangles."""
+        import numpy as np
+        from screen_reader.card_detector import CardDetector
 
-    def test_transitive_clustering(self):
-        from screen_reader.table_state import TableStateReader
-        # Three fragments in a chain: A near B, B near C, A far from C
-        # Should all merge via transitivity
-        boxes = [(10, 10, 20, 20), (25, 10, 20, 20), (40, 10, 20, 20)]
-        clusters = TableStateReader._cluster_boxes(boxes)
-        assert len(clusters) == 1
-
-    def test_empty_boxes(self):
-        from screen_reader.table_state import TableStateReader
-        assert TableStateReader._cluster_boxes([]) == []
-
-    def test_single_box(self):
-        from screen_reader.table_state import TableStateReader
-        boxes = [(10, 10, 30, 40)]
-        clusters = TableStateReader._cluster_boxes(boxes)
-        assert len(clusters) == 1
-        assert clusters[0] == (10, 10, 30, 40)
+        img = np.full((200, 300, 3), (40, 120, 30), dtype=np.uint8)
+        rects = CardDetector.find_card_rectangles(
+            img, min_card_w=20, max_card_w=100,
+            min_card_h=30, max_card_h=150)
+        assert len(rects) == 0
 
 
 if __name__ == "__main__":

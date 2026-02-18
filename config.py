@@ -107,8 +107,7 @@ class AppConfig:
     ocr_whitelist_cards: str = "23456789TJQKA♠♥♦♣shdc"
 
     # Card detection
-    card_match_threshold: float = 0.75      # Template match confidence threshold
-    use_template_matching: bool = True       # True = template match, False = OCR only
+    card_match_threshold: float = 0.55      # Template match confidence threshold
 
     # GTO engine settings
     tournament_mode: bool = True            # Tournament (ICM) vs Cash game
