@@ -224,8 +224,9 @@ class CardDetector:
     def _detect_rank(self, img: np.ndarray) -> Optional[str]:
         """Detect the rank of a card using OCR on the top-left corner.
 
-        Tries multiple preprocessing strategies to handle different card
-        styles, theme colours, and image qualities.
+        Tries multiple crop sizes and preprocessing strategies to handle
+        different card styles, theme colours, image qualities and tight
+        bounding boxes from the adaptive scanner.
         """
         if cv2 is None:
             return None
@@ -234,41 +235,52 @@ class CardDetector:
         if h < 10 or w < 10:
             return None
 
-        # The rank character is printed in the top-left corner of the card.
-        # Crop generously to ensure the character is included even if the
-        # contour bounding box is slightly off.
-        rank_region = img[1:int(h * 0.40), 1:int(w * 0.45)]
+        # Try multiple crop regions: the rank is in the top-left corner but
+        # tight adaptive crops can cut into the character.  Start with the
+        # standard region, then expand if OCR fails.
+        crop_regions = [
+            img[1:int(h * 0.40), 1:int(w * 0.45)],   # standard
+            img[0:int(h * 0.50), 0:int(w * 0.55)],    # wider fallback
+        ]
 
-        if rank_region.size == 0:
-            return None
-
-        gray = cv2.cvtColor(rank_region, cv2.COLOR_BGR2GRAY)
-
-        # Scale up for better OCR accuracy
-        scale = max(3, 60 // max(gray.shape[0], 1))  # aim for ~60px tall
-        gray = cv2.resize(gray, (gray.shape[1] * scale, gray.shape[0] * scale),
-                          interpolation=cv2.INTER_CUBIC)
-
-        # Try multiple thresholding strategies — the card background can be
-        # white (standard) or tinted (themed tables).
         ocr = self._get_ocr()
-        for thresh_method in ("otsu", "fixed_low", "fixed_high"):
-            if thresh_method == "otsu":
-                _, binary = cv2.threshold(gray, 0, 255,
-                                          cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-            elif thresh_method == "fixed_low":
-                _, binary = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY_INV)
-            else:
-                _, binary = cv2.threshold(gray, 160, 255, cv2.THRESH_BINARY_INV)
 
-            text = ocr.read_text(binary, whitelist="23456789TJQKA10",
-                                 preprocess=False)
-            text = text.strip().upper()
+        for rank_region in crop_regions:
+            if rank_region.size == 0:
+                continue
 
-            if text in RANK_OCR_MAP:
-                return RANK_OCR_MAP[text]
-            if text and text[0] in RANK_OCR_MAP:
-                return RANK_OCR_MAP[text[0]]
+            gray = cv2.cvtColor(rank_region, cv2.COLOR_BGR2GRAY)
+
+            # Scale up aggressively — aim for ~80px tall for small cards
+            scale = max(3, 80 // max(gray.shape[0], 1))
+            gray = cv2.resize(gray,
+                              (gray.shape[1] * scale, gray.shape[0] * scale),
+                              interpolation=cv2.INTER_CUBIC)
+
+            # Light Gaussian blur to reduce upscaling artifacts
+            gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+            # Try multiple thresholding strategies — the card background can
+            # be white (standard) or tinted (themed tables).
+            for thresh_method in ("otsu", "fixed_low", "fixed_high"):
+                if thresh_method == "otsu":
+                    _, binary = cv2.threshold(gray, 0, 255,
+                                              cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+                elif thresh_method == "fixed_low":
+                    _, binary = cv2.threshold(gray, 100, 255,
+                                              cv2.THRESH_BINARY_INV)
+                else:
+                    _, binary = cv2.threshold(gray, 160, 255,
+                                              cv2.THRESH_BINARY_INV)
+
+                text = ocr.read_text(binary, whitelist="23456789TJQKA10",
+                                     preprocess=False)
+                text = text.strip().upper()
+
+                if text in RANK_OCR_MAP:
+                    return RANK_OCR_MAP[text]
+                if text and text[0] in RANK_OCR_MAP:
+                    return RANK_OCR_MAP[text[0]]
 
         logger.debug("Rank OCR failed on %dx%d region", w, h)
         return None

@@ -164,14 +164,44 @@ class OCRReader:
         """
         Read a numeric value from an image (stack size, pot, bet).
         Handles formats like: 1,234  $1.5k  12.5M  1500  BB 15
+
+        Tries the full OCR text first, then individual lines (the region
+        may capture both the player name and chip count on separate lines).
+        Falls back to an alternative preprocessing pass if the default fails.
         """
         whitelist = "0123456789,.$kKmMBb. "
         text = self.read_text(img, whitelist=whitelist)
 
-        if not text:
-            return None
+        if text:
+            result = self.parse_number(text)
+            if result is not None:
+                return result
+            # Full text didn't parse — try each line separately
+            for line in text.split('\n'):
+                line = line.strip()
+                if line:
+                    result = self.parse_number(line)
+                    if result is not None:
+                        return result
 
-        return self.parse_number(text)
+        # Fallback: re-run OCR with inverted preprocessing (handles
+        # white-on-dark and dark-on-white chip counts)
+        if cv2 is not None and img is not None and img.size > 0:
+            alt = self.preprocess_for_ocr(img, invert=True, threshold=True,
+                                          scale=3.0)
+            text2 = self.read_text(alt, whitelist=whitelist, preprocess=False)
+            if text2:
+                result = self.parse_number(text2)
+                if result is not None:
+                    return result
+                for line in text2.split('\n'):
+                    line = line.strip()
+                    if line:
+                        result = self.parse_number(line)
+                        if result is not None:
+                            return result
+
+        return None
 
     @staticmethod
     def parse_number(text: str) -> Optional[float]:

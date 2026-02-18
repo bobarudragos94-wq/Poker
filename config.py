@@ -37,8 +37,8 @@ class TableRegions:
     # Pot size (center of the table above board cards)
     pot_area: Region = (320, 195, 160, 25)
 
-    # Hero stack (below hero's cards)
-    hero_stack: Region = (320, 480, 120, 20)
+    # Hero stack (below hero's cards) — generous height to capture chip count
+    hero_stack: Region = (300, 478, 160, 32)
 
     # Blind level / tournament info
     blind_info: Region = (10, 5, 200, 20)
@@ -55,13 +55,16 @@ class TableRegions:
     })
 
     # Player stacks (6-max seats, hero is seat 0)
+    # Wider and taller than minimum to tolerate layout variation across
+    # themes and window sizes.  read_number() extracts digits from
+    # whatever text OCR captures, so a bit of extra capture is safe.
     player_stacks: Dict[int, Region] = field(default_factory=lambda: {
-        0: (320, 480, 120, 20),
-        1: (85, 420, 120, 20),
-        2: (30, 250, 120, 20),
-        3: (200, 120, 120, 20),
-        4: (470, 120, 120, 20),
-        5: (620, 250, 120, 20),
+        0: (300, 478, 160, 32),
+        1: (60, 418, 160, 32),
+        2: (5, 248, 160, 32),
+        3: (175, 118, 160, 32),
+        4: (445, 118, 160, 32),
+        5: (595, 248, 160, 32),
     })
 
     # Action buttons area (fold, check/call, raise at bottom)

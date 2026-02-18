@@ -440,6 +440,30 @@ class TestTitleParsing:
         from screen_reader.table_state import TableStateReader
         assert TableStateReader._parse_blinds_from_title("Google Chrome") is None
 
+    def test_parse_blinds_skips_table_number(self):
+        """'Table 1/2' should NOT be treated as blinds."""
+        from screen_reader.table_state import TableStateReader
+        title = "Tournament #123 Table 1/2 - 400/800 ante 160 - NLH"
+        result = TableStateReader._parse_blinds_from_title(title)
+        assert result == (400.0, 800.0, 160.0)
+
+    def test_parse_blinds_prefers_ante_match(self):
+        """When multiple X/Y patterns exist, prefer the one with ante."""
+        from screen_reader.table_state import TableStateReader
+        title = "$5.50 NL [4/60 structure] - 200/400 Ante 50 - Tournament #1 Table 1"
+        result = TableStateReader._parse_blinds_from_title(title)
+        assert result == (200.0, 400.0, 50.0)
+
+    def test_parse_blinds_standalone_ante(self):
+        """Ante in a separate segment of the title should still be picked up."""
+        from screen_reader.table_state import TableStateReader
+        title = "Tournament #999 Table 5 - 500/1000 - Ante 100 - NLH"
+        result = TableStateReader._parse_blinds_from_title(title)
+        assert result is not None
+        assert result[0] == 500.0
+        assert result[1] == 1000.0
+        assert result[2] == 100.0
+
 
 class TestContourClustering:
     """Tests for union-find contour clustering used in adaptive card detection."""

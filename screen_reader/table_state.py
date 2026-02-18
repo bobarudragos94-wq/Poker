@@ -604,21 +604,30 @@ class TableStateReader:
 
     def _detect_cards_from_rects(self, img: np.ndarray,
                                   rects) -> List[Card]:
-        """Detect cards from a sequence of (x, y, w, h) bounding rects."""
+        """Detect cards from a sequence of (x, y, w, h) bounding rects.
+
+        Adds padding around each rect to ensure the rank character at the
+        top-left edge isn't clipped by a tight contour bounding box.
+        """
         h_img, w_img = img.shape[:2]
         cards = []
         for rx, ry, rw, rh in rects:
-            y1 = max(0, ry)
-            y2 = min(h_img, ry + rh)
-            x1 = max(0, rx)
-            x2 = min(w_img, rx + rw)
+            # Pad outward to capture rank/suit glyphs at card edges
+            pad_x = max(4, int(rw * 0.10))
+            pad_y = max(3, int(rh * 0.06))
+            y1 = max(0, ry - pad_y)
+            y2 = min(h_img, ry + rh + pad_y)
+            x1 = max(0, rx - pad_x)
+            x2 = min(w_img, rx + rw + pad_x)
             card_img = img[y1:y2, x1:x2]
             if card_img.size > 0:
                 card = self.card_detector.detect_card(card_img)
                 if card:
                     cards.append(card)
-                    logger.debug("Adaptive found %s at (%d,%d,%d,%d)",
-                                 card, rx, ry, rw, rh)
+                    logger.debug("Adaptive found %s at (%d,%d,%d,%d) "
+                                 "[padded to (%d,%d,%d,%d)]",
+                                 card, rx, ry, rw, rh,
+                                 x1, y1, x2 - x1, y2 - y1)
         return cards
 
     def _diagnose_hero_region(self, img: np.ndarray) -> str:
@@ -752,28 +761,60 @@ class TableStateReader:
           '$11 Mini Daily Cooldown ... - 150/300 ante 40 - Tournament 3974764671 Table 119 ...'
           '$5.50 Turbo ... - 25/50 - Tournament ...'
           'Tournament #123456 Table 1 - 1000/2000 Ante 100 - No Limit Hold''em'
+
+        The title may contain multiple ``X/Y`` patterns (e.g. ``Table 1/2``,
+        buy-in info).  We prefer the match immediately followed by "ante"
+        (a definitive indicator), then the last match with BB >= 10, then
+        any last match.
         """
         if not title:
             return None
 
-        # Look for "X/Y" optionally followed by "ante Z" (case-insensitive).
-        # This pattern reliably appears in PokerStars tournament window titles.
-        match = re.search(
-            r'(\d[\d,]*)\s*/\s*(\d[\d,]*)\s*(?:ante\s+(\d[\d,]*))?',
-            title, re.IGNORECASE,
-        )
-        if match:
-            try:
-                sb = float(match.group(1).replace(",", ""))
-                bb = float(match.group(2).replace(",", ""))
-                ante = float(match.group(3).replace(",", "")) if match.group(3) else 0.0
-                if sb > bb:
-                    sb, bb = bb, sb
-                logger.debug("Parsed blinds from title: sb=%.0f bb=%.0f ante=%.0f",
-                             sb, bb, ante)
-                return (sb, bb, ante)
-            except (ValueError, IndexError):
-                pass
+        pattern = r'(\d[\d,]*)\s*/\s*(\d[\d,]*)\s*(?:ante\s+(\d[\d,]*))?'
+        matches = list(re.finditer(pattern, title, re.IGNORECASE))
+
+        if not matches:
+            return None
+
+        # 1. Prefer a match that captured "ante" directly
+        ante_matches = [m for m in matches if m.group(3)]
+        if ante_matches:
+            chosen = ante_matches[0]
+        else:
+            # 2. Last match with big-blind >= 10 (skip tiny "Table 1/2" etc.)
+            chosen = None
+            for m in reversed(matches):
+                try:
+                    bb_val = float(m.group(2).replace(",", ""))
+                    if bb_val >= 10:
+                        chosen = m
+                        break
+                except ValueError:
+                    continue
+            if chosen is None:
+                chosen = matches[-1]
+
+        try:
+            sb = float(chosen.group(1).replace(",", ""))
+            bb = float(chosen.group(2).replace(",", ""))
+            ante = (float(chosen.group(3).replace(",", ""))
+                    if chosen.group(3) else 0.0)
+            if sb > bb:
+                sb, bb = bb, sb
+
+            # If ante wasn't captured inline, look for a standalone
+            # "ante X" anywhere in the title.
+            if ante == 0:
+                ante_match = re.search(r'ante\s+(\d[\d,]*)',
+                                       title, re.IGNORECASE)
+                if ante_match:
+                    ante = float(ante_match.group(1).replace(",", ""))
+
+            logger.debug("Parsed blinds from title: sb=%.0f bb=%.0f ante=%.0f",
+                         sb, bb, ante)
+            return (sb, bb, ante)
+        except (ValueError, IndexError):
+            pass
         return None
 
     def _read_players(self, img: np.ndarray) -> List[PlayerState]:
