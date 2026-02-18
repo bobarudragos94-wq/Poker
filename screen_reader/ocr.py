@@ -210,29 +210,57 @@ class OCRReader:
         """
         Read blind level from the table header.
         Returns (small_blind, big_blind, ante) or None.
-        Formats: "100/200" or "100/200 ante 25" or "Level 5: 100/200/25"
+
+        Recognised formats (from PokerStars):
+            "100/200"
+            "100/200 ante 25"
+            "Level 5: 100/200"
+            "Level 5 100/200/25"
+            "Blinds 100/200 Ante 25"
         """
-        text = self.read_text(img, whitelist="0123456789/: anteLevelBblid")
+        text = self.read_text(img, whitelist="0123456789/: anteLevelBblid,.")
 
         if not text:
             return None
 
-        # Extract numbers from the text
-        numbers = re.findall(r'[\d,]+', text.replace(",", ""))
+        logger.debug("Blind OCR raw text: %r", text)
 
-        if len(numbers) >= 2:
+        # First try to find the SB/BB pattern with a slash separator.
+        # This is the most reliable indicator: <number>/<number>
+        slash_match = re.search(r'([\d,]+)\s*/\s*([\d,]+)(?:\s*/\s*([\d,]+))?', text)
+        if slash_match:
             try:
-                sb = float(numbers[-3]) if len(numbers) >= 3 else float(numbers[0])
-                bb = float(numbers[-2]) if len(numbers) >= 3 else float(numbers[1])
-                ante = float(numbers[-1]) if len(numbers) >= 3 else 0
-                # Heuristic: if 3 numbers and last is much smaller, it's ante
-                if len(numbers) >= 3 and ante > bb:
-                    sb = float(numbers[0])
-                    bb = float(numbers[1])
-                    ante = float(numbers[2]) if len(numbers) > 2 else 0
+                sb = float(slash_match.group(1).replace(",", ""))
+                bb = float(slash_match.group(2).replace(",", ""))
+                ante = 0.0
+                if slash_match.group(3):
+                    ante = float(slash_match.group(3).replace(",", ""))
+                # Sanity: SB should be <= BB
+                if sb > bb:
+                    sb, bb = bb, sb
+                # Look for a separate "ante" keyword with a number after
+                if ante == 0:
+                    ante_match = re.search(r'ante\s*([\d,]+)', text, re.IGNORECASE)
+                    if ante_match:
+                        ante = float(ante_match.group(1).replace(",", ""))
                 return (sb, bb, ante)
             except (ValueError, IndexError):
                 pass
+
+        # Fallback: extract all numbers and guess SB/BB from the two largest
+        # adjacent values  (handles OCR that mangles the slash).
+        numbers = [float(n.replace(",", "")) for n in re.findall(r'[\d,]+', text)
+                   if n.replace(",", "").isdigit()]
+        if len(numbers) >= 2:
+            # Take the last two adjacent numbers that look like blinds
+            # (skip a leading "Level N" number)
+            sb, bb, ante = numbers[-2], numbers[-1], 0.0
+            if len(numbers) >= 3 and numbers[-1] < numbers[-2]:
+                # Third number is probably ante
+                sb, bb, ante = numbers[-3], numbers[-2], numbers[-1]
+            if sb > bb:
+                sb, bb = bb, sb
+            return (sb, bb, ante)
 
         return None
 

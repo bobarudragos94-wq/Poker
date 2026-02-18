@@ -107,6 +107,23 @@ class ScreenCapture:
             logger.debug("DwmGetWindowAttribute failed: %s", e)
         return None
 
+    @staticmethod
+    def _get_client_rect(hwnd) -> Optional[Tuple[int, int, int, int]]:
+        """Get the client area (content only, no title bar / borders) in screen coords."""
+        try:
+            import ctypes
+            import ctypes.wintypes
+            # GetClientRect gives (0, 0, width, height) in client coords
+            client = ctypes.wintypes.RECT()
+            ctypes.windll.user32.GetClientRect(hwnd, ctypes.byref(client))
+            # Convert client (0,0) to screen coords
+            pt = ctypes.wintypes.POINT(0, 0)
+            ctypes.windll.user32.ClientToScreen(hwnd, ctypes.byref(pt))
+            return (pt.x, pt.y, client.right, client.bottom)
+        except Exception as e:
+            logger.debug("GetClientRect failed: %s", e)
+        return None
+
     def _find_window_win32(self) -> Optional[Tuple[int, int, int, int]]:
         """Find window on Windows using win32gui."""
         if not HAS_WIN32:
@@ -120,18 +137,24 @@ class ScreenCapture:
                 title = win32gui.GetWindowText(hwnd)
                 if (self.window_title.lower() in title.lower() or
                         self._is_pokerstars_window(title)):
-                    # Use DWM to get actual visible bounds (excludes shadow)
-                    dwm_rect = ScreenCapture._get_dwm_frame_rect(hwnd)
-                    if dwm_rect:
-                        result.append(dwm_rect)
+                    # Prefer client area (excludes title bar and borders)
+                    client_rect = ScreenCapture._get_client_rect(hwnd)
+                    if client_rect and client_rect[2] > 0 and client_rect[3] > 0:
+                        logger.info("Using client area rect: %s", client_rect)
+                        result.append(client_rect)
                     else:
-                        # Fallback: clamp negative coords from GetWindowRect
-                        rect = win32gui.GetWindowRect(hwnd)
-                        left, top, right, bottom = rect
-                        adj_left = max(0, left)
-                        adj_top = max(0, top)
-                        result.append((adj_left, adj_top,
-                                       right - adj_left, bottom - adj_top))
+                        # Fallback: DWM frame bounds (excludes shadow)
+                        dwm_rect = ScreenCapture._get_dwm_frame_rect(hwnd)
+                        if dwm_rect:
+                            result.append(dwm_rect)
+                        else:
+                            # Last resort: clamp negative coords from GetWindowRect
+                            rect = win32gui.GetWindowRect(hwnd)
+                            left, top, right, bottom = rect
+                            adj_left = max(0, left)
+                            adj_top = max(0, top)
+                            result.append((adj_left, adj_top,
+                                           right - adj_left, bottom - adj_top))
 
         win32gui.EnumWindows(enum_callback, None)
 

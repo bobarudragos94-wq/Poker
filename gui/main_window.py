@@ -393,15 +393,18 @@ class MainWindow(QMainWindow):
             # Log state summary periodically (every ~5 seconds)
             self._scan_tick_count = getattr(self, '_scan_tick_count', 0) + 1
             if self._scan_tick_count % 10 == 1:
+                bbox = self.table_reader._table_bbox
                 logger.info(
                     "Scan state: hero_cards=%s board=%s pot=%.1f "
-                    "blinds=%s/%s street=%s players=%d dealer=%d",
+                    "blinds=%s/%s street=%s players=%d dealer=%d "
+                    "table_bbox=%s",
                     [str(c) for c in state.hero_cards],
                     [str(c) for c in state.board_cards],
                     state.pot_size,
                     state.small_blind, state.big_blind,
                     state.street, state.active_players,
                     state.dealer_seat,
+                    bbox,
                 )
 
             # Get decision

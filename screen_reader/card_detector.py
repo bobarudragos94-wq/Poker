@@ -163,14 +163,25 @@ class CardDetector:
         # Convert to HSV
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
-        # Check for white/light pixels (card background)
-        # Cards are mostly white with S < 50 and V > 180
-        lower_white = np.array([0, 0, 180])
-        upper_white = np.array([180, 50, 255])
+        # Check for white / light pixels (card background).
+        # Relaxed from V>180 to V>150 and S<70 to handle off-white cards,
+        # slight gradients, and different PokerStars themes.
+        lower_white = np.array([0, 0, 150])
+        upper_white = np.array([180, 70, 255])
         mask = cv2.inRange(hsv, lower_white, upper_white)
 
         white_ratio = np.sum(mask > 0) / mask.size
-        return white_ratio > 0.15  # At least 15% white pixels = card present
+
+        # Also check that the region is NOT dominated by green (empty felt).
+        lower_green = np.array([25, 25, 30])
+        upper_green = np.array([95, 255, 220])
+        green_mask = cv2.inRange(hsv, lower_green, upper_green)
+        green_ratio = np.sum(green_mask > 0) / green_mask.size
+
+        logger.debug("Card presence check: white=%.2f green=%.2f", white_ratio, green_ratio)
+
+        # Card present if enough white AND not mostly green felt
+        return white_ratio > 0.10 and green_ratio < 0.60
 
     def _detect_rank(self, img: np.ndarray) -> Optional[str]:
         """Detect the rank of a card using OCR on the top-left corner."""

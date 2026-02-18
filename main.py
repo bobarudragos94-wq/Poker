@@ -17,6 +17,21 @@ import os
 import argparse
 import logging
 
+# Enable DPI awareness on Windows BEFORE any GUI imports.
+# Without this, win32gui returns logical (scaled) coordinates while mss
+# captures at physical-pixel resolution, causing every region crop to be
+# offset and mis-sized.
+if sys.platform == "win32":
+    try:
+        import ctypes
+        # Per-monitor DPI aware (Windows 8.1+)
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 

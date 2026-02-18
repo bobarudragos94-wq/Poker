@@ -4,11 +4,17 @@ to build a complete picture of the current game state.
 """
 
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple
 
 import numpy as np
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 
 from .capture import ScreenCapture
 from .ocr import OCRReader
@@ -156,6 +162,56 @@ class TableStateReader:
         self.card_detector = CardDetector(match_threshold=config.card_match_threshold)
         self.regions = config.regions
         self._last_state: Optional[GameState] = None
+        # Cached table-felt bounding box (x, y, w, h) within the captured image
+        self._table_bbox: Optional[Tuple[int, int, int, int]] = None
+        self._table_bbox_miss_count: int = 0
+        self._debug_frame_count: int = 0
+        # Set to True (or pass --verbose) to dump cropped regions to disk
+        self.debug_save_regions: bool = logging.getLogger().isEnabledFor(logging.DEBUG)
+
+    @staticmethod
+    def _detect_table_felt(img: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+        """Detect the green felt table area within the captured window image.
+
+        PokerStars tables have a large green/teal oval felt area.  When the
+        window aspect ratio differs from the baseline 800x600 (4:3), the
+        client adds dark padding.  Finding the actual table bounds lets us
+        scale the baseline regions accurately.
+
+        Returns (x, y, w, h) of the bounding rectangle of the felt area,
+        or None if detection fails.
+        """
+        if cv2 is None:
+            return None
+
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+        # PokerStars felt is green/teal: H 35-90, S 30-255, V 40-220
+        # This deliberately wide range covers the various PokerStars themes
+        lower = np.array([25, 25, 30])
+        upper = np.array([95, 255, 220])
+        mask = cv2.inRange(hsv, lower, upper)
+
+        # Morphological close to fill small gaps in the felt
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+        # Find the largest contour (should be the table)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+
+        largest = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(largest)
+        img_area = img.shape[0] * img.shape[1]
+
+        # The felt should cover a significant portion of the image (>15%)
+        if area < img_area * 0.15:
+            return None
+
+        x, y, w, h = cv2.boundingRect(largest)
+        return (x, y, w, h)
 
     def read_state(self) -> Optional[GameState]:
         """
@@ -169,11 +225,33 @@ class TableStateReader:
             return self._last_state
 
         h_img, w_img = table_img.shape[:2]
+
+        # Detect the actual table felt area to handle aspect-ratio differences
+        # between the captured window and the 800x600 baseline.
+        felt_bbox = self._detect_table_felt(table_img)
+        if felt_bbox is not None:
+            self._table_bbox = felt_bbox
+            self._table_bbox_miss_count = 0
+            logger.debug("Table felt detected at %s (image %dx%d)", felt_bbox, w_img, h_img)
+        else:
+            self._table_bbox_miss_count += 1
+            if self._table_bbox_miss_count > 20:
+                self._table_bbox = None  # stale, drop it
+            if self._table_bbox is not None:
+                logger.debug("Table felt not detected this frame, using cached bbox")
+            else:
+                logger.debug("Table felt not detected; falling back to full image")
+
         logger.debug("Captured table image: %dx%d (baseline %dx%d, scale %.2fx%.2f)",
                       w_img, h_img, BASELINE_WIDTH, BASELINE_HEIGHT,
                       w_img / BASELINE_WIDTH, h_img / BASELINE_HEIGHT)
 
         state = GameState(timestamp=time.time())
+
+        # Save full-table debug screenshot on first few frames
+        self._debug_frame_count += 1
+        if self._debug_frame_count <= 3:
+            self._save_debug_image(table_img, f"full_table_{self._debug_frame_count}")
 
         # Read hero's cards
         state.hero_cards = self._read_hero_cards(table_img)
@@ -241,12 +319,31 @@ class TableStateReader:
         self._last_state = state
         return state
 
+    def _save_debug_image(self, img: np.ndarray, name: str):
+        """Save a debug image to disk (only when debug logging is on)."""
+        if not self.debug_save_regions or cv2 is None:
+            return
+        import sys as _sys
+        if getattr(_sys, "frozen", False):
+            base = os.path.dirname(_sys.executable)
+        else:
+            base = os.path.dirname(os.path.abspath(__file__))
+        debug_dir = os.path.join(base, "debug_regions")
+        os.makedirs(debug_dir, exist_ok=True)
+        path = os.path.join(debug_dir, f"{name}.png")
+        try:
+            cv2.imwrite(path, img)
+        except Exception:
+            pass
+
     def _read_hero_cards(self, img: np.ndarray) -> List[Card]:
         """Read hero's hole cards."""
         cards = []
-        for region in [self.regions.hero_card1, self.regions.hero_card2]:
+        for idx, region in enumerate([self.regions.hero_card1, self.regions.hero_card2]):
             card_img = self._crop_region(img, region)
             if card_img is not None:
+                if self._debug_frame_count < 3:
+                    self._save_debug_image(card_img, f"hero_card{idx}")
                 card = self.card_detector.detect_card(card_img)
                 if card:
                     cards.append(card)
@@ -282,6 +379,8 @@ class TableStateReader:
         """Read blind level information."""
         blind_img = self._crop_region(img, self.regions.blind_info)
         if blind_img is not None:
+            if self._debug_frame_count <= 3:
+                self._save_debug_image(blind_img, "blind_info")
             return self.ocr.read_blind_level(blind_img)
         return None
 
@@ -363,19 +462,29 @@ class TableStateReader:
 
     @staticmethod
     def _scale_region(region: Tuple[int, int, int, int],
-                      img_w: int, img_h: int) -> Tuple[int, int, int, int]:
-        """Scale a region from the 800x600 baseline to the actual image size."""
-        x, y, w, h = region
-        sx = img_w / BASELINE_WIDTH
-        sy = img_h / BASELINE_HEIGHT
-        return (int(x * sx), int(y * sy), int(w * sx), int(h * sy))
+                      img_w: int, img_h: int,
+                      table_bbox: Optional[Tuple[int, int, int, int]] = None,
+                      ) -> Tuple[int, int, int, int]:
+        """Scale a region from the 800x600 baseline to the actual image size.
 
-    @staticmethod
-    def _crop_region(img: np.ndarray, region: Tuple[int, int, int, int]) -> Optional[np.ndarray]:
+        If *table_bbox* is provided the region is scaled relative to that
+        sub-rectangle (the detected green-felt area) instead of the full
+        captured image.  This correctly handles windows whose aspect ratio
+        differs from the 4:3 baseline (e.g. 1920x1140).
+        """
+        bx, by, bw, bh = table_bbox if table_bbox else (0, 0, img_w, img_h)
+        x, y, w, h = region
+        sx = bw / BASELINE_WIDTH
+        sy = bh / BASELINE_HEIGHT
+        return (int(bx + x * sx), int(by + y * sy), int(w * sx), int(h * sy))
+
+    def _crop_region(self, img: np.ndarray,
+                     region: Tuple[int, int, int, int]) -> Optional[np.ndarray]:
         """Crop a region from the full table image, scaling from baseline 800x600."""
         h_img, w_img = img.shape[:2]
-        # Scale region from baseline to actual image dimensions
-        x, y, w, h = TableStateReader._scale_region(region, w_img, h_img)
+        # Scale region, using the detected table-felt bbox when available
+        x, y, w, h = self._scale_region(region, w_img, h_img,
+                                         table_bbox=self._table_bbox)
         # Clamp to image boundaries
         x = max(0, min(x, w_img - 1))
         y = max(0, min(y, h_img - 1))
@@ -442,8 +551,3 @@ class TableStateReader:
 
         self._last_state = state
         return state
-
-try:
-    import cv2
-except ImportError:
-    cv2 = None
