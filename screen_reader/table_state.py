@@ -319,15 +319,14 @@ class TableStateReader:
 
         h_img, w_img = img.shape[:2]
 
-        # Search area: center 60% of width, 38-72% from top.
-        # On a 1920x1111 PokerStars table the hero cards sit at ~47-52%
-        # of the client-area height.  We start at 38% for headroom and
-        # end at 72%.  Width is 20-80% to cover hero positions on 5-max,
-        # 6-max, and 9-max layouts.  Contour clustering + size filters
-        # handle any non-card white blobs that fall in this region.
+        # Search area: 20-80% width, 45-72% height.
+        # On a PokerStars table the community cards (flop/turn/river)
+        # sit at ~33-42% height and hero cards at ~47-55%.  Starting at
+        # 45% avoids picking up community cards by mistake.
+        # Width is 20-80% to cover hero positions on 5/6/9-max layouts.
         sx1 = int(w_img * 0.20)
         sx2 = int(w_img * 0.80)
-        sy1 = int(h_img * 0.38)
+        sy1 = int(h_img * 0.45)
         sy2 = int(h_img * 0.72)
         search = img[sy1:sy2, sx1:sx2]
 
@@ -671,7 +670,7 @@ class TableStateReader:
             # Save the wide search area (same region as adaptive scanner)
             sx1 = int(w_img * 0.20)
             sx2 = int(w_img * 0.80)
-            sy1 = int(h_img * 0.38)
+            sy1 = int(h_img * 0.45)
             sy2 = int(h_img * 0.72)
             search_crop = img[sy1:sy2, sx1:sx2].copy()
 
